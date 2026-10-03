@@ -9,6 +9,28 @@ rules:
   - apiGroups: ["karpenter.sh"]
     resources: ["nodeclaims", "nodeclaims/status", "nodepools", "nodepools/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Owner references with blockOwnerDeletion, needed when the
+  # OwnerReferencesPermissionEnforcement admission plugin is enabled.
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeclaims/finalizers", "nodepools/finalizers"]
+    verbs: ["create", "update", "patch", "delete"]
+  # NodeOverlay (feature gate NodeOverlay).
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeoverlays", "nodeoverlays/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeoverlays/status"]
+    verbs: ["update", "patch"]
+  # CapacityBuffer (feature gate CapacityBuffer) and the pod templates it references.
+  - apiGroups: ["autoscaling.x-k8s.io"]
+    resources: ["capacitybuffers", "capacitybuffers/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling.x-k8s.io"]
+    resources: ["capacitybuffers/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["podtemplates"]
+    verbs: ["get", "list", "watch"]
   # Provider node class.
   - apiGroups: ["karpenter.hetzner.cloud"]
     resources: ["hcloudnodeclasses", "hcloudnodeclasses/status"]
@@ -24,6 +46,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods/eviction"]
     verbs: ["create"]
+  # Force-delete pods once a node's terminationGracePeriod expires
+  # (NodePool terminationGracePeriod, NodeRepair).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
