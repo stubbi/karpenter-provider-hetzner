@@ -263,3 +263,31 @@ func TestResolve_UnsupportedFamilyIsPermanent(t *testing.T) {
 		t.Errorf("unsupported family must be permanent, got %T: %v", err, err)
 	}
 }
+
+func TestResolveUbuntu_LabelSelectorFallsBackToNewestSnapshot(t *testing.T) {
+	fc := &mockImageClient{images: []*hcloud.Image{
+		makeImage(1, hcloud.ImageTypeSnapshot, hcloud.ArchitectureX86, "k8s-node-v1.36.4-old", baseTime),
+		makeImage(2, hcloud.ImageTypeSnapshot, hcloud.ArchitectureX86, "k8s-node-v1.36.4-new", baseTime.Add(time.Hour)),
+	}}
+	p := NewProvider(fc)
+	sel := apiv1.ImageSelector{Family: "ubuntu", Selector: map[string]string{"role": "k8s-node"}}
+	img, err := p.Resolve(context.Background(), sel, hcloud.ArchitectureX86)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if img.ID != 2 {
+		t.Errorf("expected newest snapshot (ID=2), got ID=%d", img.ID)
+	}
+	if got := fc.lastOpts.LabelSelector; got != "role=k8s-node" {
+		t.Fatalf("label selector not forwarded to snapshot lookup: got %q", got)
+	}
+}
+
+func TestResolveUbuntu_NoSelectorIgnoresSnapshots(t *testing.T) {
+	p := NewProvider(&mockImageClient{images: []*hcloud.Image{
+		makeImage(1, hcloud.ImageTypeSnapshot, hcloud.ArchitectureX86, "ubuntu snapshot", baseTime),
+	}})
+	if _, err := p.Resolve(context.Background(), apiv1.ImageSelector{Family: "ubuntu"}, hcloud.ArchitectureX86); err == nil {
+		t.Fatal("expected no match: snapshots need a label selector")
+	}
+}

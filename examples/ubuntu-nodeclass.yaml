@@ -122,6 +122,12 @@ spec:
         name: ubuntu-default
 
       requirements:
+        # Hetzner has no spot capacity. Pin on-demand, or Karpenter core sets spot on
+        # every consolidation replacement and the replacement never launches.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+
         - key: kubernetes.io/arch
           operator: In
           values: [amd64]

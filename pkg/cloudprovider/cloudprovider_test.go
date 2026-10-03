@@ -397,7 +397,10 @@ func TestList_ReturnsManagedServers(t *testing.T) {
 
 func TestDelete_RemovesServer(t *testing.T) {
 	cp, fsc, _ := buildCPWithTypes(t, baselineNodeClass(), []*hcloud.ServerType{cx22Type()})
-	fsc.servers[77] = &hcloud.Server{ID: 77}
+	fsc.servers[77] = &hcloud.Server{ID: 77, Labels: map[string]string{
+		apiv1.ServerLabelManagedBy: apiv1.ServerValueManagedBy,
+		apiv1.ServerLabelCluster:   "test-cluster",
+	}}
 	nodeClaim := &karpv1.NodeClaim{}
 	nodeClaim.Status.ProviderID = instance.FormatProviderID(77)
 	if err := cp.Delete(context.Background(), nodeClaim); err != nil {

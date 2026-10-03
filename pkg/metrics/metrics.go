@@ -29,6 +29,15 @@ var (
 		Help:      "Total number of Hetzner server create calls by result.",
 	}, []string{"result"})
 
+	// serverCreateErrorsTotal counts failed server creates by hcloud error code, so
+	// quota exhaustion (resource_limit_exceeded) is visible on its own rather than
+	// hidden among capacity errors Karpenter routes around.
+	serverCreateErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "karpenter_hetzner",
+		Name:      "server_create_errors_total",
+		Help:      "Total number of failed Hetzner server creates by hcloud error code.",
+	}, []string{"code"})
+
 	// serverCreateDurationSeconds measures how long server creates take (wall
 	// time from Create call through action-wait completion).
 	serverCreateDurationSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -94,6 +103,7 @@ var (
 func init() {
 	crmetrics.Registry.MustRegister(
 		serverCreateTotal,
+		serverCreateErrorsTotal,
 		serverCreateDurationSeconds,
 		serverDeleteTotal,
 		hcloudAPICallsTotal,
@@ -111,6 +121,12 @@ func RecordServerCreate(result string, dur time.Duration) {
 	serverCreateTotal.WithLabelValues(result).Inc()
 	serverCreateDurationSeconds.Observe(dur.Seconds())
 	hcloudAPICallsTotal.WithLabelValues("server_create", result).Inc()
+}
+
+// RecordServerCreateError records a failed server create by hcloud error code
+// ("other" when the error carries none).
+func RecordServerCreateError(code string) {
+	serverCreateErrorsTotal.WithLabelValues(code).Inc()
 }
 
 // RecordServerDelete records a server delete result.

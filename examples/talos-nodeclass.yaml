@@ -97,6 +97,12 @@ spec:
         name: talos-default
 
       requirements:
+        # Hetzner has no spot capacity. Pin on-demand, or Karpenter core sets spot on
+        # every consolidation replacement and the replacement never launches.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+
         # Constrain to x86-64 nodes.  Talos images are arch-specific; make
         # sure your imageSelector.selector value matches this architecture.
         - key: kubernetes.io/arch

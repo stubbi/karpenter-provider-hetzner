@@ -2,6 +2,7 @@ package instance
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -127,9 +128,21 @@ func (p *Provider) Create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 	result := metrics.ResultSuccess
 	if err != nil {
 		result = metrics.ResultError
+		metrics.RecordServerCreateError(errorCode(err))
 	}
 	metrics.RecordServerCreate(result, time.Since(start))
 	return server, err
+}
+
+// errorCode returns the hcloud error code in err's chain, or "other": a bounded
+// label value that tells quota (resource_limit_exceeded) from a type being out of
+// stock (resource_unavailable).
+func errorCode(err error) string {
+	var he hcloud.Error
+	if errors.As(err, &he) && he.Code != "" {
+		return string(he.Code)
+	}
+	return "other"
 }
 
 // create is the internal implementation of Create, instrumented by Create().
@@ -268,6 +281,15 @@ func (p *Provider) delete(ctx context.Context, providerID string) error {
 		// the signal Karpenter's termination controller uses to remove the NodeClaim
 		// finalizer. Returning nil makes it requeue indefinitely and leaks the NodeClaim.
 		return karpcp.NewNodeClaimNotFoundError(fmt.Errorf("server %d not found", id))
+	}
+	// The API token can delete every server in the project, which may hold other
+	// clusters and non-Karpenter servers. Only delete what List would return. A plain
+	// error keeps the NodeClaim terminating and loud instead of forgetting it.
+	if server.Labels[apiv1.ServerLabelManagedBy] != apiv1.ServerValueManagedBy ||
+		server.Labels[apiv1.ServerLabelCluster] != p.clusterName {
+		return fmt.Errorf("refusing to delete server %d (%s): not labelled %s=%s,%s=%s",
+			id, server.Name, apiv1.ServerLabelManagedBy, apiv1.ServerValueManagedBy,
+			apiv1.ServerLabelCluster, p.clusterName)
 	}
 
 	log.Info("deleting server", "serverID", id)

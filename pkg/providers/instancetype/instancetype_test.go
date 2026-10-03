@@ -3,6 +3,7 @@ package instancetype
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	corev1 "k8s.io/api/core/v1"
@@ -253,6 +254,35 @@ func TestToInstanceType_IgnoresLocationAvailableFlag(t *testing.T) {
 	if !o.Available {
 		t.Error("gated on Locations[].Available: a priced, creatable offering was excluded " +
 			"from ranking, which falls through to a far pricier type")
+	}
+}
+
+// TestToInstanceType_RetiredLocationUnavailable: what hcloud reports for cpx41 -- still
+// priced everywhere, deprecated per location. Past unavailable_after every create fails
+// with "unsupported location for server type"; before it the type is still orderable.
+func TestToInstanceType_RetiredLocationUnavailable(t *testing.T) {
+	st := makeServerType("cpx41", hcloud.ArchitectureX86, hcloud.CPUTypeShared, 8, 16, 240,
+		[]hcloud.ServerTypeLocationPricing{
+			{Location: &hcloud.Location{Name: "fsn1"}, Hourly: hcloud.Price{Net: "0.0400"}},
+			{Location: &hcloud.Location{Name: "hel1"}, Hourly: hcloud.Price{Net: "0.0400"}},
+			{Location: &hcloud.Location{Name: "ash"}, Hourly: hcloud.Price{Net: "0.0400"}},
+		})
+	deprecated := func(unavailableAfter time.Time) hcloud.DeprecatableResource {
+		return hcloud.DeprecatableResource{Deprecation: &hcloud.DeprecationInfo{UnavailableAfter: unavailableAfter}}
+	}
+	st.Locations = []hcloud.ServerTypeLocation{
+		{Location: &hcloud.Location{Name: "fsn1"}, DeprecatableResource: deprecated(time.Now().Add(-time.Hour))},
+		{Location: &hcloud.Location{Name: "hel1"}, DeprecatableResource: deprecated(time.Now().Add(time.Hour))},
+		{Location: &hcloud.Location{Name: "ash"}},
+	}
+	it := toInstanceType(st)
+	if o := offeringFor(it, "fsn1"); o == nil || o.Available {
+		t.Errorf("fsn1 is past unavailable_after: offering must stay listed but unavailable, got %+v", o)
+	}
+	for _, zone := range []string{"hel1", "ash"} {
+		if o := offeringFor(it, zone); o == nil || !o.Available {
+			t.Errorf("%s is still orderable: offering must stay available, got %+v", zone, o)
+		}
 	}
 }
 

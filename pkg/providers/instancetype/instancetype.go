@@ -234,6 +234,19 @@ func toInstanceType(st *hcloud.ServerType) *cloudprovider.InstanceType {
 	// that. Withdrawn pairs are handled reactively by the unavailable cache, which marks
 	// a pair only after a real create failure and so cannot be fooled in either
 	// direction.
+	//
+	// A location's deprecation is different: once its unavailable_after has passed, hcloud
+	// refuses every create there ("unsupported location for server type") while the type
+	// stays priced. That is a published retirement date, not a stock reading, so those
+	// offerings are unavailable up front instead of each costing a failed create and a
+	// 5-minute quarantine per burst (cpx11-cpx51 in fsn1/nbg1/hel1 since 2026-01-01).
+	retired := map[string]bool{}
+	now := time.Now()
+	for _, l := range st.Locations {
+		if l.Location != nil && l.IsDeprecated() && now.After(l.UnavailableAfter()) {
+			retired[l.Location.Name] = true
+		}
+	}
 	offerings := make(cloudprovider.Offerings, 0, len(st.Pricings))
 	for _, p := range st.Pricings {
 		if p.Location == nil {
@@ -253,7 +266,7 @@ func toInstanceType(st *hcloud.ServerType) *cloudprovider.InstanceType {
 			// replacement-consolidation until pricing recovers. No representable value
 			// avoids core's 0-fallback; the exposure is bounded by the pricing outage.
 			Price:     price,
-			Available: priced,
+			Available: priced && !retired[p.Location.Name],
 		})
 	}
 

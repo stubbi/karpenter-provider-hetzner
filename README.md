@@ -109,6 +109,12 @@ spec:
         kind: HCloudNodeClass
         name: default
       requirements:
+        # Hetzner has no spot capacity. Pin on-demand, or Karpenter core sets spot on
+        # every consolidation replacement and the replacement never launches.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+
         # Pinned to amd64 so this pool never picks an architecture your images may
         # not have. Add arm64 (and see examples/nodepool-multiarch.yaml) once your
         # images are published as multi-arch manifests.
@@ -187,6 +193,7 @@ comments explaining every field.
 
 - Pricing uses the **net** hourly figure, so relative comparisons match your Hetzner invoice (before VAT).
 - Hetzner bills the primary IPv4 separately. On private-network clusters, set `enablePublicIPv4: false` to drop it.
+- Hetzner has no spot capacity. Pin `karpenter.sh/capacity-type` to `on-demand` in every NodePool. Without the pin, Karpenter core sets `spot` on every consolidation replacement. No offering matches, and the replacement never launches. New nodes, `Empty` and `Drifted` still work, so the fault is easy to miss (#88).
 - Selection is cheapest-first, so a NodePool that permits several architectures or families gets whichever priced offering is cheapest for the requested shape — which may be ARM (CAX). Constrain `kubernetes.io/arch` or `server-family` to steer Karpenter, and publish multi-arch images before allowing arm64.
 
 ## Development

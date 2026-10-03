@@ -122,6 +122,13 @@ locals {
                   operator = "In"
                   values   = np.locations
                 },
+                {
+                  # Hetzner has no spot capacity. Pin on-demand, or Karpenter core sets
+                  # spot on every consolidation replacement and it never launches.
+                  key      = "karpenter.sh/capacity-type"
+                  operator = "In"
+                  values   = ["on-demand"]
+                },
               ],
             )
             taints = np.taints
