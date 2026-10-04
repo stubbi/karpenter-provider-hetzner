@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-03
+
 ### Changed
+- **BREAKING** — the image and the OCI chart moved registries. The repository now lives at `github.com/stubbi/karpenter-provider-hetzner`, so releases publish to `ghcr.io/stubbi/karpenter-provider-hetzner` and `oci://ghcr.io/stubbi/charts/karpenter-provider-hetzner`, and the chart's `image.repository` default points there. Releases up to 2.2.0 stay at `ghcr.io/paperclipinc` and nothing newer is published there, so `helm upgrade` has to name the new chart URL. A release that sets `image.repository` itself keeps its own value.
 - Every NodePool in the README, `examples/` and the Terraform integration pins `karpenter.sh/capacity-type` to `on-demand`. Karpenter core sets `spot` on every consolidation replacement when a NodePool allows both capacity types. This provider has on-demand offerings only, so such a replacement never launched and the disruption controller retried without end (#88).
 - The k3s guide recommends a scoped k3s agent token (`--agent-token`) over the server `node-token`, and documents that `userDataSecretRef` keeps a token out of git and out of the NodeClass but **not off the node** — Hetzner serves userData from the instance metadata service at `169.254.169.254`, readable from inside the server (#51).
 - **BREAKING (chart 3.0.0)** — chart resource names and label selectors are scoped to the Helm release. Every object previously carried the hardcoded name `karpenter-provider-hetzner` and every selector matched on `app.kubernetes.io/name` alone, so two releases in one namespace could not coexist: Helm refuses to adopt an object owned by another release, and even past that the two Deployments' selectors each matched both releases' pods, so two ReplicaSet controllers reconciled the same pods against different desired states. The Service, PodDisruptionBudget and ServiceMonitor selectors had the identical omission. Every selector now carries `app.kubernetes.io/instance` (#73).
@@ -143,7 +146,8 @@ detection, observability, supply-chain attestations, and adoption docs.
 - Grant full Karpenter-core RBAC in Helm chart (#13).
 - Treat `unsupported location for server type` as an unavailable offering rather than a hard error (#16).
 
-[Unreleased]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v2.2.0...v3.0.0
 [2.2.0]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.0.0...v2.1.0
