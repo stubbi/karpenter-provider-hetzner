@@ -8,7 +8,7 @@ appVersion: "3.0.0"
 # "Homepage" links drive backlinks to the domain; GitHub stays as source.
 home: https://paperclip.inc/karpenter-hetzner
 sources:
-  - https://github.com/paperclipinc/karpenter-provider-hetzner
+  - https://github.com/stubbi/karpenter-provider-hetzner
 keywords:
   - karpenter
   - hetzner
@@ -23,14 +23,16 @@ annotations:
     - name: Homepage
       url: https://paperclip.inc/karpenter-hetzner
     - name: source
-      url: https://github.com/paperclipinc/karpenter-provider-hetzner
+      url: https://github.com/stubbi/karpenter-provider-hetzner
     - name: Talos bootstrap guide
-      url: https://github.com/paperclipinc/karpenter-provider-hetzner/blob/main/docs/talos-bootstrap.md
+      url: https://github.com/stubbi/karpenter-provider-hetzner/blob/main/docs/talos-bootstrap.md
     - name: k3s bootstrap guide
-      url: https://github.com/paperclipinc/karpenter-provider-hetzner/blob/main/docs/k3s-bootstrap.md
+      url: https://github.com/stubbi/karpenter-provider-hetzner/blob/main/docs/k3s-bootstrap.md
   artifacthub.io/category: integration-delivery
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/changes: |
+    - kind: changed
+      description: "BREAKING: the chart and the image are published under ghcr.io/stubbi. image.repository defaults to ghcr.io/stubbi/karpenter-provider-hetzner, and helm upgrade must name oci://ghcr.io/stubbi/charts/karpenter-provider-hetzner"
     - kind: changed
       description: "BREAKING: resource names and label selectors are scoped to the Helm release. Upgrading from 2.x requires deleting the existing Deployment (its .spec.selector is immutable) -- see the chart README's Upgrading section"
     - kind: fixed
@@ -41,3 +43,7 @@ annotations:
       description: "serviceAccount.name defaults to the release-scoped name instead of \"karpenter\", which is also what the upstream karpenter chart creates"
     - kind: added
       description: "nameOverride and fullnameOverride"
+    - kind: fixed
+      description: "The ClusterRole grants everything karpenter core requires, including pods delete, so drains past terminationGracePeriod and NodeRepair can finish"
+    - kind: added
+      description: "hcloud.apiTimeout bounds each hcloud API request (default 30s)"
