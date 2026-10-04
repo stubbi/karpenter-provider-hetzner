@@ -1,7 +1,7 @@
 .PHONY: build test lint generate generate-verify vendor-core-crds docker-build test-envtest
 
 BINARY         := karpenter-provider-hetzner
-IMAGE          := ghcr.io/paperclipinc/karpenter-provider-hetzner
+IMAGE          := ghcr.io/stubbi/karpenter-provider-hetzner
 TAG            ?= latest
 CONTROLLER_GEN := go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0
 ENVTEST        := go run sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
