@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-10-03
+
+### Fixed
+- The release workflow publishes the chart again. `v3.0.0` was tagged and its image was published and signed, but the SBOM step then failed while attaching the SBOM to the GitHub release with the workflow's read-only token, and the chart publish step after it never ran. The step no longer uploads to the release; the SBOM stays a workflow artifact and an in-registry attestation, as in every earlier release. **The 3.0.0 chart was never published. Use 3.0.1**, which is otherwise identical to 3.0.0.
+
 ## [3.0.0] - 2026-10-03
 
 ### Changed
@@ -146,7 +151,8 @@ detection, observability, supply-chain attestations, and adoption docs.
 - Grant full Karpenter-core RBAC in Helm chart (#13).
 - Treat `unsupported location for server type` as an unavailable offering rather than a hard error (#16).
 
-[Unreleased]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.1...HEAD
+[3.0.1]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v2.2.0...v3.0.0
 [2.2.0]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.1.0...v2.1.1
