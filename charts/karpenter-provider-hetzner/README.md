@@ -54,7 +54,7 @@ Delete the Deployment first, keeping its pods running while you do, then upgrade
 
 ```bash
 kubectl delete deployment karpenter-provider-hetzner -n <namespace> --cascade=orphan
-helm upgrade <release> oci://ghcr.io/stubbi/charts/karpenter-provider-hetzner --version 3.0.0 --reuse-values
+helm upgrade <release> oci://ghcr.io/stubbi/charts/karpenter-provider-hetzner --version 3.0.1 --reuse-values
 kubectl delete pod -n <namespace> -l app.kubernetes.io/name=karpenter-provider-hetzner \
   --field-selector status.phase=Running --ignore-not-found  # orphaned old pods
 ```
