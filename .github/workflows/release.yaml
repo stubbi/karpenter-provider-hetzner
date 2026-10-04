@@ -59,6 +59,11 @@ jobs:
           image: "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
           artifact-name: sbom-${{ github.ref_name }}.spdx.json
           output-file: sbom-${{ github.ref_name }}.spdx.json
+          # The SBOM is a workflow artifact and an in-registry attestation. Do not
+          # also attach it to the GitHub release: that needs contents: write, and
+          # with the read-only token the step fails whenever a release already
+          # exists for the tag, which skips the chart publish below (v3.0.0).
+          upload-release-assets: false
 
       - name: Publish Helm chart (OCI)
         run: |
