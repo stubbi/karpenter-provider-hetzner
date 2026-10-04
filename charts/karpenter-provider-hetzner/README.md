@@ -54,7 +54,7 @@ Delete the Deployment first, keeping its pods running while you do, then upgrade
 
 ```bash
 kubectl delete deployment karpenter-provider-hetzner -n <namespace> --cascade=orphan
-helm upgrade <release> oci://ghcr.io/paperclipinc/charts/karpenter-provider-hetzner --version 3.0.0 --reuse-values
+helm upgrade <release> oci://ghcr.io/stubbi/charts/karpenter-provider-hetzner --version 3.0.0 --reuse-values
 kubectl delete pod -n <namespace> -l app.kubernetes.io/name=karpenter-provider-hetzner \
   --field-selector status.phase=Running --ignore-not-found  # orphaned old pods
 ```
@@ -88,7 +88,7 @@ unchanged.
 | `nameOverride` | `""` | Replaces the chart name in generated names and `app.kubernetes.io/name` |
 | `fullnameOverride` | `""` | Replaces the generated resource name outright |
 | `replicas` | `1` | Controller replicas |
-| `image.repository` | `ghcr.io/paperclipinc/karpenter-provider-hetzner` | Image |
+| `image.repository` | `ghcr.io/stubbi/karpenter-provider-hetzner` | Image |
 | `image.tag` | `""` | Empty tracks the chart appVersion; pin a tag in production |
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy |
 | `auth.secretRef.name` | `hcloud-token` | Secret holding the Hetzner token |
