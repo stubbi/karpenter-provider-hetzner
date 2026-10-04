@@ -3,7 +3,7 @@
 
 variable "karpenter_helm_repository" {
   type        = string
-  default     = "oci://ghcr.io/paperclipinc/charts"
+  default     = "oci://ghcr.io/stubbi/charts"
   description = "OCI repository hosting the karpenter-provider-hetzner chart."
 }
 
