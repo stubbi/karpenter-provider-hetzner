@@ -1,7 +1,7 @@
 # Artifact Hub repository metadata for the OCI Helm chart.
 # Push this to the OCI registry alongside the chart so Artifact Hub can verify
 # ownership:
-#   oci://ghcr.io/paperclipinc/charts
+#   oci://ghcr.io/stubbi/charts/karpenter-provider-hetzner
 # See https://artifacthub.io/docs/topics/repositories/helm-charts/#oci-registries
 #
 # repositoryID is issued by Artifact Hub when the repo is first registered at
