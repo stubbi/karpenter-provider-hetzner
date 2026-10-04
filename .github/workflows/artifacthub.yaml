@@ -1,0 +1,34 @@
+name: Artifact Hub metadata
+
+# Artifact Hub verifies ownership of an OCI chart repository by reading
+# artifacthub-repo.yml from the `artifacthub.io` tag that sits next to the chart
+# versions. Without it the listing loses its Verified Publisher badge. The
+# release workflow only pushes chart versions, so this publishes the metadata
+# whenever the file changes, and on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - artifacthub-repo.yml
+      - .github/workflows/artifacthub.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Push artifacthub-repo.yml next to the chart
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          oras push "ghcr.io/${{ github.repository_owner }}/charts/karpenter-provider-hetzner:artifacthub.io" \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
