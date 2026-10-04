@@ -1,6 +1,6 @@
 # karpenter-provider-hetzner
 
-[![CI](https://github.com/paperclipinc/karpenter-provider-hetzner/actions/workflows/ci.yaml/badge.svg)](https://github.com/paperclipinc/karpenter-provider-hetzner/actions/workflows/ci.yaml)
+[![CI](https://github.com/stubbi/karpenter-provider-hetzner/actions/workflows/ci.yaml/badge.svg)](https://github.com/stubbi/karpenter-provider-hetzner/actions/workflows/ci.yaml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/paperclipinc/karpenter-provider-hetzner)](https://goreportcard.com/report/github.com/paperclipinc/karpenter-provider-hetzner)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/karpenter-provider-hetzner)](https://artifacthub.io/packages/helm/karpenter-provider-hetzner/karpenter-provider-hetzner)
@@ -59,7 +59,7 @@ kubectl create secret generic hcloud-token \
   --from-literal=token=$HCLOUD_TOKEN
 
 helm install karpenter-provider-hetzner \
-  oci://ghcr.io/paperclipinc/charts/karpenter-provider-hetzner \
+  oci://ghcr.io/stubbi/charts/karpenter-provider-hetzner \
   --namespace kube-system \
   --set clusterName=my-cluster \
   --set auth.secretRef.name=hcloud-token
@@ -72,7 +72,7 @@ Three CRDs ship in the chart's `crds/` directory and are installed automatically
 > **Upgrading:** Helm only ever *installs* resources from `crds/`; it never updates them. When upgrading to a chart whose karpenter core version changed, apply the CRDs yourself before `helm upgrade`:
 >
 > ```bash
-> kubectl apply --server-side -f https://raw.githubusercontent.com/paperclipinc/karpenter-provider-hetzner/main/charts/karpenter-provider-hetzner/crds/
+> kubectl apply --server-side -f https://raw.githubusercontent.com/stubbi/karpenter-provider-hetzner/main/charts/karpenter-provider-hetzner/crds/
 > ```
 
 ## Usage
