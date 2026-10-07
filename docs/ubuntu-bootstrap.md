@@ -99,6 +99,20 @@ journalctl -u kubelet --no-pager | tail -40
 
 ---
 
+### Kubelet reservations
+
+Once a node has joined, check that the NodeClass's `spec.kubelet` matches the
+reservations its kubelet actually applies, or Karpenter will size nodes larger
+than they are and leave pods Pending:
+
+```bash
+kubectl get --raw /api/v1/nodes/<node>/proxy/configz \
+  | jq '.kubeletconfig | {systemReserved, kubeReserved, evictionHard}'
+```
+
+Copy any non-empty values into `spec.kubelet` (see the README's NodeClass
+reference for the exact semantics).
+
 ## Trade-offs vs Talos
 
 | | Ubuntu + kubeadm | Talos |

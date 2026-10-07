@@ -177,3 +177,17 @@ Common join failures:
 | Node never appears | Token expired; update the Secret and delete the pending NodeClaim so Karpenter retries. |
 | Node appears, `NotReady` | Control-plane endpoint unreachable from the private network; check firewall rules and network routing. |
 | `ImagesReady=False` | No image matches the selector for the requested arch; check `hcloud image list --selector caph-image-name=...`. |
+
+### Kubelet reservations
+
+Once a node has joined, check that the NodeClass's `spec.kubelet` matches the
+reservations its kubelet actually applies, or Karpenter will size nodes larger
+than they are and leave pods Pending:
+
+```bash
+kubectl get --raw /api/v1/nodes/<node>/proxy/configz \
+  | jq '.kubeletconfig | {systemReserved, kubeReserved, evictionHard}'
+```
+
+Copy any non-empty values into `spec.kubelet` (see the README's NodeClass
+reference for the exact semantics).

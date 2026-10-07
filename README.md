@@ -69,11 +69,18 @@ helm install karpenter-provider-hetzner \
 
 Three CRDs ship in the chart's `crds/` directory and are installed automatically by Helm: `HCloudNodeClass` (this provider) plus the `NodePool` and `NodeClaim` core CRDs from `karpenter.sh`, which the controller watches. No separate CRD install step is needed.
 
-> **Upgrading:** Helm only ever *installs* resources from `crds/`; it never updates them. When upgrading to a chart whose karpenter core version changed, apply the CRDs yourself before `helm upgrade`:
+> **Upgrading:** Helm only ever *installs* resources from `crds/`; it never updates them. When upgrading to a chart whose CRDs changed (this provider's `HCloudNodeClass`, or the karpenter core version), apply the CRDs yourself before `helm upgrade`; the release notes say when that is the case:
 >
 > ```bash
-> kubectl apply --server-side -f https://raw.githubusercontent.com/stubbi/karpenter-provider-hetzner/main/charts/karpenter-provider-hetzner/crds/
+> VERSION=vX.Y.Z   # the release you are upgrading to
+> BASE=https://raw.githubusercontent.com/stubbi/karpenter-provider-hetzner/$VERSION/charts/karpenter-provider-hetzner/crds
+> kubectl apply --server-side --force-conflicts \
+>   -f $BASE/karpenter.hetzner.cloud_hcloudnodeclasses.yaml \
+>   -f $BASE/karpenter.sh_nodeclaims.yaml \
+>   -f $BASE/karpenter.sh_nodepools.yaml
 > ```
+>
+> `--force-conflicts` is needed because Helm created the CRDs and still owns their fields. If a GitOps tool manages your CRDs instead, update them there; it would revert a manual apply.
 
 ## Usage
 
@@ -158,6 +165,7 @@ Provisioned nodes carry, in addition to the well-known Karpenter labels:
 | `labels` | `map[string]string` | no | — | Extra hcloud labels on the Hetzner server (useful for cost attribution or firewall label-selectors) |
 | `userData` | `string` | no | — | Inline cloud-init / Talos machine config. Overridden by `userDataSecretRef` when both are set. |
 | `userDataSecretRef` | `object {namespace, name, key}` | no | — | Source `userData` from a Secret instead of inline. The Secret is read at server-create time; its value never appears in the NodeClass spec or git. Takes precedence over `userData`. |
+| `kubelet` | `object {systemReserved, kubeReserved, evictionHard}` | no | `kubeReserved: {cpu: 100m, memory: 100Mi}` | The reservations your `userData` configures on the kubelet, so Karpenter subtracts them from allocatable. Descriptive only, the provider does not configure the kubelet: keep it in agreement with your bootstrap. Without it (or with it empty) only the default shown is subtracted; once it declares anything, it is taken at its word. `evictionHard` takes a quantity or a percentage of capacity, without the kubelet flag's `<`; a signal you leave out is assumed at the kubelet default (`memory.available: 100Mi`, `nodefs.available: 10%`), so declare `"0%"` for one your kubelet does not enforce. To read the values off a running node on any distribution: `kubectl get --raw /api/v1/nodes/<node>/proxy/configz \| jq '.kubeletconfig \| {systemReserved, kubeReserved, evictionHard}'`. |
 
 Status exposes `conditions` (`ImagesReady`, `NetworkReady`, `ResourcesReady`, `UserDataReady`, aggregated into `Ready`) and `resolvedImages` (image ID per architecture).
 

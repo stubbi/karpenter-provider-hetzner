@@ -346,7 +346,7 @@ func TestCreate_InsufficientCapacityMarksUnavailable(t *testing.T) {
 		t.Fatal("expected error on capacity failure")
 	}
 	// The offering for (cx22, nbg1) should now be marked unavailable.
-	its, lerr := typeProvider.List(context.Background(), []string{"nbg1"})
+	its, lerr := typeProvider.List(context.Background(), &apiv1.HCloudNodeClass{Spec: apiv1.HCloudNodeClassSpec{Locations: []string{"nbg1"}}})
 	if lerr != nil {
 		t.Fatal(lerr)
 	}
@@ -1285,5 +1285,37 @@ func TestCreate_IgnoresStaleGenerationResolvedImage(t *testing.T) {
 	}
 	if got := fsc.lastOpts.Image.ID; got != 42 {
 		t.Errorf("launched image %d, want 42 from a live lookup (99 means the pre-edit status entry won)", got)
+	}
+}
+
+// TestGetInstanceTypes_AppliesNodeClassKubelet checks that the node class the
+// NodePool references, not a nil or default one, is what sizes the overhead.
+func TestGetInstanceTypes_AppliesNodeClassKubelet(t *testing.T) {
+	nc := baselineNodeClass()
+	nc.Spec.Kubelet = &apiv1.KubeletConfiguration{
+		SystemReserved: map[string]apiv1.ReservedQuantity{"cpu": "200m", "memory": "512Mi"},
+		KubeReserved:   map[string]apiv1.ReservedQuantity{"cpu": "200m", "memory": "512Mi"},
+		EvictionHard:   map[string]apiv1.EvictionThreshold{"memory.available": "400Mi"},
+	}
+	cp, _, _ := buildCPWithTypes(t, nc, []*hcloud.ServerType{cx22Type()})
+
+	nodePool := &karpv1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	nodePool.Spec.Template.Spec.NodeClassRef = &karpv1.NodeClassReference{
+		Name: "default", Group: apiv1.Group, Kind: "HCloudNodeClass",
+	}
+	its, err := cp.GetInstanceTypes(context.Background(), nodePool)
+	if err != nil {
+		t.Fatalf("GetInstanceTypes: %v", err)
+	}
+	if len(its) != 1 {
+		t.Fatalf("expected 1 instance type, got %d", len(its))
+	}
+	capMem, allocMem := its[0].Capacity[corev1.ResourceMemory], its[0].Allocatable()[corev1.ResourceMemory]
+	if got := (capMem.Value() - allocMem.Value()) >> 20; got != 1424 {
+		t.Errorf("memory reserved %dMi, want the declared 1424Mi", got)
+	}
+	capCPU, allocCPU := its[0].Capacity[corev1.ResourceCPU], its[0].Allocatable()[corev1.ResourceCPU]
+	if got := capCPU.MilliValue() - allocCPU.MilliValue(); got != 400 {
+		t.Errorf("cpu reserved %dm, want the declared 400m", got)
 	}
 }

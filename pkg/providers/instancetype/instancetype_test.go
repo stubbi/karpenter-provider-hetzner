@@ -8,6 +8,8 @@ import (
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+
+	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
 )
 
 // mockServerTypeClient is a fake ServerTypeClient for testing.
@@ -68,7 +70,7 @@ func TestList_LocationFilter(t *testing.T) {
 	p := NewProvider(client)
 
 	// Only request nbg1; fsn1 offering should be filtered out but type still returned.
-	types, err := p.List(context.Background(), []string{"nbg1"})
+	types, err := p.List(context.Background(), &apiv1.HCloudNodeClass{Spec: apiv1.HCloudNodeClassSpec{Locations: []string{"nbg1"}}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestList_LocationFilterExcludesAll(t *testing.T) {
 	client := &mockServerTypeClient{types: []*hcloud.ServerType{st}}
 	p := NewProvider(client)
 
-	types, err := p.List(context.Background(), []string{"hel1"}) // not in pricings
+	types, err := p.List(context.Background(), &apiv1.HCloudNodeClass{Spec: apiv1.HCloudNodeClassSpec{Locations: []string{"hel1"}}}) // not in pricings
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -67,8 +67,11 @@ func NewProvider(client ServerTypeClient) *Provider {
 	}
 }
 
-// List returns all available InstanceTypes, filtered to those with offerings in the given locations.
-// Results are cached for 6 hours.
+// List returns all available InstanceTypes for a node class, filtered to those
+// with offerings in its locations. A nil node class lists every type with no
+// location filter and the default overhead. The hcloud catalogue is cached for 6
+// hours; anything node-class-specific is applied per call (see applyAvailability),
+// so a node class edit takes effect immediately.
 //
 // The hcloud call happens with no reader-visible lock held. Holding the cache
 // lock across it made every caller wait on the slowest possible hcloud request,
@@ -78,10 +81,15 @@ func NewProvider(client ServerTypeClient) *Provider {
 //
 // Refreshes are still serialized, by a separate mutex that only refreshers take,
 // so a burst of concurrent misses makes one API call rather than one per caller.
-func (p *Provider) List(ctx context.Context, locations []string) ([]*cloudprovider.InstanceType, error) {
+func (p *Provider) List(ctx context.Context, nodeClass *apiv1.HCloudNodeClass) ([]*cloudprovider.InstanceType, error) {
+	var locations []string
+	if nodeClass != nil {
+		locations = nodeClass.Spec.Locations
+	}
+
 	if types, ok := p.freshCache(); ok {
 		metrics.RecordCacheHit()
-		return p.applyAvailability(filterByLocations(types, locations)), nil
+		return p.applyAvailability(filterByLocations(types, locations), nodeClass), nil
 	}
 
 	p.refreshMu.Lock()
@@ -90,7 +98,7 @@ func (p *Provider) List(ctx context.Context, locations []string) ([]*cloudprovid
 	// Another goroutine may have refreshed while this one waited for refreshMu.
 	if types, ok := p.freshCache(); ok {
 		metrics.RecordCacheHit()
-		return p.applyAvailability(filterByLocations(types, locations)), nil
+		return p.applyAvailability(filterByLocations(types, locations), nodeClass), nil
 	}
 
 	metrics.RecordCacheMiss()
@@ -112,7 +120,7 @@ func (p *Provider) List(ctx context.Context, locations []string) ([]*cloudprovid
 			metrics.RecordCacheStale()
 			logf.FromContext(ctx).Error(err, "hcloud server-type catalogue unreadable; serving the last one fetched",
 				"age", age.Round(time.Second).String())
-			return p.applyAvailability(filterByLocations(stale, locations)), nil
+			return p.applyAvailability(filterByLocations(stale, locations), nodeClass), nil
 		}
 		// Nothing was ever fetched, so there is nothing to fall back to.
 		return nil, err
@@ -124,7 +132,7 @@ func (p *Provider) List(ctx context.Context, locations []string) ([]*cloudprovid
 	}
 	p.store(types)
 
-	return p.applyAvailability(filterByLocations(types, locations)), nil
+	return p.applyAvailability(filterByLocations(types, locations), nodeClass), nil
 }
 
 // freshCache returns the cached catalogue when it is present and unexpired.
@@ -168,14 +176,15 @@ func (p *Provider) MarkUnavailable(serverType, location string) {
 // applyAvailability returns copies of the given instance types with each
 // offering's Available flag computed live from the unavailable cache, so the
 // 6h type-catalog cache never bakes in (and thus never staleness-traps)
-// availability.
+// availability. Overhead is computed here too, from the node class's declared
+// kubelet reservations, because the cached catalogue is shared by every class.
 //
 // The returned InstanceType and Offering structs are fresh value-copies, so
-// setting Available never mutates the cached entries. Note that nested
-// reference fields (Requirements, Capacity, Overhead) are intentionally shared
-// with the cache, not deep-copied: callers must treat returned types as
-// read-only and must not mutate those maps.
-func (p *Provider) applyAvailability(types []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {
+// setting Available never mutates the cached entries, and Overhead is built
+// fresh per call. Requirements and Capacity are intentionally shared with the
+// cache, not deep-copied: callers must treat returned types as read-only and
+// must not mutate those maps.
+func (p *Provider) applyAvailability(types []*cloudprovider.InstanceType, nodeClass *apiv1.HCloudNodeClass) []*cloudprovider.InstanceType {
 	out := make([]*cloudprovider.InstanceType, len(types))
 	for i, it := range types {
 		offerings := make(cloudprovider.Offerings, len(it.Offerings))
@@ -188,20 +197,21 @@ func (p *Provider) applyAvailability(types []*cloudprovider.InstanceType) []*clo
 			offerings[j] = &cp
 		}
 		// Construct a fresh InstanceType (rather than copying *it) to avoid
-		// copying the embedded sync.Once (govet copylocks); Requirements/Capacity/
-		// Overhead are intentionally shared read-only with the cached entry.
+		// copying the embedded sync.Once (govet copylocks); Requirements/Capacity
+		// are intentionally shared read-only with the cached entry.
 		out[i] = &cloudprovider.InstanceType{
 			Name:         it.Name,
 			Offerings:    offerings,
 			Requirements: it.Requirements,
 			Capacity:     it.Capacity,
-			Overhead:     it.Overhead,
+			Overhead:     overheadFor(nodeClass, it.Capacity),
 		}
 	}
 	return out
 }
 
-// toInstanceType maps a Hetzner ServerType to a Karpenter InstanceType.
+// toInstanceType maps a Hetzner ServerType to a Karpenter InstanceType. The result
+// is cached across every node class, so only node-class-independent facts belong here.
 func toInstanceType(st *hcloud.ServerType) *cloudprovider.InstanceType {
 	arch := "amd64"
 	if st.Architecture == hcloud.ArchitectureARM {
@@ -291,12 +301,7 @@ func toInstanceType(st *hcloud.ServerType) *cloudprovider.InstanceType {
 			corev1.ResourceEphemeralStorage: *resource.NewQuantity(diskBytes, resource.BinarySI),
 			corev1.ResourcePods:             *resource.NewQuantity(110, resource.DecimalSI),
 		},
-		Overhead: &cloudprovider.InstanceTypeOverhead{
-			KubeReserved: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("100Mi"),
-			},
-		},
+		// Overhead depends on the node class, so applyAvailability fills it in.
 	}
 }
 
@@ -365,7 +370,6 @@ func filterByLocations(types []*cloudprovider.InstanceType, locations []string) 
 				Offerings:    filtered,
 				Requirements: it.Requirements,
 				Capacity:     it.Capacity,
-				Overhead:     it.Overhead,
 			})
 		}
 	}

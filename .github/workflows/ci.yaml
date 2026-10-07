@@ -45,7 +45,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - run: go test -race -count=1 ./pkg/controllers/...
+      # test-envtest also installs the shipped CRDs on a real API server and checks
+      # their admission rules, which plain go test skips without KUBEBUILDER_ASSETS.
+      - run: make test-envtest
 
   # The chart had no CI at all until a release-scoping bug (#73) shipped in it.
   # These renders are cheap and catch the whole class of failure that reaches

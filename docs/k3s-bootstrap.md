@@ -82,12 +82,36 @@ whether or not the NodePool mentions it.
 
 ### Kubelet reservations
 
-This provider advertises a fixed allocatable overhead per node. If your k3s
-agents set `kube-reserved` / `system-reserved` / `eviction-hard` values that
-differ from what the provider models, the scheduler's view of the node and the
-kubelet's disagree, and pods are placed on nodes that cannot admit them. k3s
-sets no reservations by default, which is what the provider currently assumes.
-See #68 for making this configurable.
+If your k3s agents set `kube-reserved` / `system-reserved` / `eviction-hard`,
+declare the same values under the NodeClass's `spec.kubelet`. Without it the
+provider assumes a flat 100m/100Mi `kubeReserved`, the scheduler's view of the
+node and the kubelet's disagree, and pods are placed on nodes that cannot admit
+them.
+
+Give each `eviction-hard` value without the `<` (`memory.available: 400Mi`). A
+signal you leave out is assumed at the kubelet default, while a stock kubelet
+given any `eviction-hard` enforces only the signals listed, so list every
+signal you set, and declare `"0%"` for any you want counted as zero.
+
+If you do not pass `eviction-hard` at all, k3s still sets its own:
+`imagefs.available<5%,nodefs.available<5%`, with no memory threshold. Declare
+that explicitly, or the kubelet's 100Mi/10% defaults are assumed instead:
+
+```yaml
+kubelet:
+  evictionHard: {memory.available: "0%", nodefs.available: 5%, imagefs.available: 5%}
+```
+
+When in doubt, read the running values off a node, as the README describes.
+
+```yaml
+kubelet:
+  systemReserved: {cpu: 200m, memory: 512Mi}
+  kubeReserved: {cpu: 200m, memory: 512Mi}
+  evictionHard: {memory.available: 400Mi, nodefs.available: 10%}
+```
+
+with the agent flag `eviction-hard=memory.available<400Mi,nodefs.available<10%`.
 
 ---
 

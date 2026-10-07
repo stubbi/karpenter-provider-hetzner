@@ -4,7 +4,7 @@ BINARY         := karpenter-provider-hetzner
 IMAGE          := ghcr.io/stubbi/karpenter-provider-hetzner
 TAG            ?= latest
 CONTROLLER_GEN := go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0
-ENVTEST        := go run sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+ENVTEST        := go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.2
 ENVTEST_K8S_VERSION ?= 1.34.0
 
 build:
@@ -46,8 +46,8 @@ generate-verify: generate
 	fi
 
 test-envtest:
-	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" \
-		go test -race -count=1 ./pkg/controllers/...
+	assets="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" && [ -n "$$assets" ] && \
+		KUBEBUILDER_ASSETS="$$assets" go test -race -count=1 ./pkg/controllers/... ./pkg/apis/...
 
 docker-build:
 	docker build -t $(IMAGE):$(TAG) .

@@ -167,7 +167,7 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	// can disagree. The gate defaults off. This is closable here rather than upstream:
 	// Create needs the nodeoverlay store, not the decorator, and the store is public and
 	// already held in main.go. Left to a follow-up to keep this change reviewable.
-	instanceTypes, err := cp.typeProvider.List(ctx, nodeClass.Spec.Locations)
+	instanceTypes, err := cp.typeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, fmt.Errorf("listing instance types: %w", err)
 	}
@@ -373,7 +373,7 @@ func (cp *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.
 		return nil, fmt.Errorf("resolving node class for node pool %s: %w", nodePool.Name, err)
 	}
 
-	its, err := cp.typeProvider.List(ctx, nodeClass.Spec.Locations)
+	its, err := cp.typeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, err
 	}

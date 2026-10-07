@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `HCloudNodeClass.spec.kubelet` declares the reservations the node's bootstrap applies (`systemReserved`, `kubeReserved`, `evictionHard`), so Karpenter subtracts them when computing allocatable. Previously only a flat 100m/100Mi `kubeReserved` was subtracted whatever the bootstrap reserved, so Karpenter could pick a server the pod did not fit on, leaving it Pending while the empty node was consolidated and replaced. A NodeClass without the field keeps exactly the previous behaviour; one that declares anything is taken at its word, so the flat 100m/100Mi no longer applies to it. Values are validated at admission; the README shows how to read them off a running node on any distribution (#68).
+- **This release changes the `HCloudNodeClass` CRD.** Helm does not upgrade CRDs: apply them before `helm upgrade` as the README describes, or `spec.kubelet` is dropped by the API server.
+
 ## [3.0.1] - 2026-10-03
 
 ### Fixed
