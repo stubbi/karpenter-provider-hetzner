@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Push artifacthub-repo.yml next to the chart
         run: |
