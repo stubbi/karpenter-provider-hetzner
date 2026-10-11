@@ -291,6 +291,7 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 		NodeClaim:              nodeClaim.Name,
 		NodePool:               nodePoolName,
 		PlacementGroupStrategy: nodeClass.Spec.PlacementGroupStrategy,
+		PlacementGroupIDs:      nodeClass.Spec.PlacementGroupIDs,
 		EnablePublicIPv4:       nodeClass.Spec.PublicIPv4Enabled(),
 		EnablePublicIPv6:       nodeClass.Spec.PublicIPv6Enabled(),
 	})
