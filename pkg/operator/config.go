@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,6 +24,15 @@ const (
 	// minutes it stops bounding anything and just reintroduces the hang it exists
 	// to prevent.
 	maxAPITimeout = 5 * time.Minute
+
+	// defaultOrphanGracePeriod is how old a server must be before the orphan
+	// controller may reclaim it. It has to outlast a slow boot plus core's 15m
+	// registration timeout, after which core deletes an unregistered NodeClaim.
+	defaultOrphanGracePeriod = 30 * time.Minute
+
+	// minOrphanGracePeriod refuses settings short enough to reclaim a server
+	// whose NodeClaim core has not yet given up on.
+	minOrphanGracePeriod = 15 * time.Minute
 )
 
 // Config holds provider configuration sourced from the environment.
@@ -35,6 +45,13 @@ type Config struct {
 	// operation: the SDK's action waiter polls in a loop of separate requests, so
 	// a create that legitimately takes minutes is many short requests.
 	APITimeout time.Duration
+
+	// OrphanGCEnabled turns on reclaiming servers created for a NodeClaim that no
+	// longer exists and that never became a Node.
+	OrphanGCEnabled bool
+
+	// OrphanGCGracePeriod is the minimum server age before it can be reclaimed.
+	OrphanGCGracePeriod time.Duration
 }
 
 // LoadConfig reads provider configuration from the environment.
@@ -51,7 +68,37 @@ func LoadConfig() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Config{ClusterName: name, APITimeout: timeout}, nil
+	gcEnabled, gcGrace, err := loadOrphanGC()
+	if err != nil {
+		return nil, err
+	}
+	return &Config{ClusterName: name, APITimeout: timeout, OrphanGCEnabled: gcEnabled, OrphanGCGracePeriod: gcGrace}, nil
+}
+
+// loadOrphanGC reads ORPHAN_GC_ENABLED (default true) and
+// ORPHAN_GC_GRACE_PERIOD (default 30m, at least 15m). Invalid values are errors,
+// not silent fallbacks, for the same reason as HCLOUD_API_TIMEOUT.
+func loadOrphanGC() (bool, time.Duration, error) {
+	enabled := true
+	if raw := strings.TrimSpace(os.Getenv("ORPHAN_GC_ENABLED")); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return false, 0, fmt.Errorf("ORPHAN_GC_ENABLED %q is not a boolean: %w", raw, err)
+		}
+		enabled = v
+	}
+	grace := defaultOrphanGracePeriod
+	if raw := strings.TrimSpace(os.Getenv("ORPHAN_GC_GRACE_PERIOD")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return false, 0, fmt.Errorf("ORPHAN_GC_GRACE_PERIOD %q is not a valid duration (e.g. \"30m\"): %w", raw, err)
+		}
+		if d < minOrphanGracePeriod {
+			return false, 0, fmt.Errorf("ORPHAN_GC_GRACE_PERIOD %q is below the %s minimum: a shorter period can reclaim a server whose NodeClaim is still waiting to register", raw, minOrphanGracePeriod)
+		}
+		grace = d
+	}
+	return enabled, grace, nil
 }
 
 // loadAPITimeout reads HCLOUD_API_TIMEOUT as a Go duration (e.g. "45s", "1m"),

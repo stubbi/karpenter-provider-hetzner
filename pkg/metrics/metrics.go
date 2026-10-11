@@ -111,6 +111,14 @@ var (
 		Help:      "Unix time at which the hcloud API request budget is fully replenished, from the last RateLimit-Reset header seen.",
 	})
 
+	// orphanedServersReclaimedTotal counts servers deleted by the orphan
+	// controller: created for a NodeClaim that no longer exists, never a Node.
+	orphanedServersReclaimedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "karpenter_hetzner",
+		Name:      "orphaned_servers_reclaimed_total",
+		Help:      "Total number of orphaned Hetzner servers (NodeClaim gone, never registered) deleted.",
+	})
+
 	// imageCacheTotal counts image-resolution cache lookups by result (hit|miss).
 	imageCacheTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "karpenter_hetzner",
@@ -142,7 +150,13 @@ func init() {
 		rateLimitRemaining,
 		rateLimitReset,
 		imageCacheTotal,
+		orphanedServersReclaimedTotal,
 	)
+}
+
+// RecordOrphanReclaimed records one orphaned server deleted.
+func RecordOrphanReclaimed() {
+	orphanedServersReclaimedTotal.Inc()
 }
 
 // RecordRateLimit records the hcloud request budget and what is left of it.
