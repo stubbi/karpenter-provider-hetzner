@@ -21,7 +21,7 @@ version tag in production.
 - **All Hetzner Cloud server types** — CX, CPX, CAX, CCX, including ARM (CAX).
 - **Cost-optimal scheduling** — offerings are priced from Hetzner's live per-hour net price, so Karpenter bin-packs onto the cheapest type that fits.
 - **Capacity-aware** — when Hetzner reports a type as unavailable in a location, that offering is skipped for a short window so scheduling falls back to an alternative instead of looping on a sold-out combination.
-- **Drift detection** — image, network, firewall, and server-type drift trigger node replacement.
+- **Drift detection** — image (pinned selectors only), NodeClass spec (userData, SSH keys, placement, public IPs), network, firewall, location, label and server-type drift trigger node replacement. See [Drift](#drift).
 - **Talos Linux and Ubuntu images**, resolved per architecture.
 - **Placement groups** for spreading nodes across physical hosts.
 - **Cost controls** — opt out of the billed public IPv4 (and/or IPv6) per node class for private-network clusters.
@@ -172,6 +172,16 @@ Provisioned nodes carry, in addition to the well-known Karpenter labels:
 Why the default `kubeReserved` is a flat 100m/100Mi rather than a curve scaled by cores and memory: the kubelet reserves nothing by default, and what a node actually reserves is whatever its bootstrap writes into the kubelet config. A GKE/EKS-style tiered formula would be wrong for every bootstrap this provider supports, so the provider keeps the historical flat default (changing it would silently move every existing node's allocatable) and makes the real values declarable through `kubelet` instead.
 
 Status exposes `conditions` (`ImagesReady`, `NetworkReady`, `ResourcesReady`, `UserDataReady`, aggregated into `Ready`) and `resolvedImages` (image ID per architecture).
+
+### Drift
+
+A node is replaced (`Drifted`) when it no longer matches its NodeClass:
+
+- **Observed on the server**: network, firewalls (every declared one attached), location (still allowed), labels (every declared one present) and server type are compared live, which also catches out-of-band changes.
+- **Image**: compared against the image the NodeClass resolves now for the node's architecture, **only when `imageSelector` pins it** with `version` or `selector`. A bare selector means "the newest matching image", and following it would roll the whole fleet whenever someone uploads a matching snapshot, so it never drifts on image. To roll nodes onto a new image, pin the selector and change the pin.
+- **Not observable on the server**: `userData`, `userDataSecretRef` (the reference, not the Secret's contents), `sshKeyIDs`, `placementGroupStrategy`, `enablePublicIPv4` and `enablePublicIPv6` are hashed. The hash is recorded on each NodeClaim at launch (`karpenter.hetzner.cloud/nodeclass-hash`), and an edit to any of these fields rolls nodes. Rotating the contents of a userData Secret does not; change the reference to roll deliberately. `kubelet` and `vmMemoryOverheadPercent` only describe nodes to the scheduler, so they do not roll nodes.
+
+On upgrade to the first release with the hash, existing NodeClaims have no recorded hash. They are not treated as drifted. The provider records the current hash on them instead, so upgrading replaces nothing and the first NodeClass edit after that rolls them.
 
 ## Examples
 
