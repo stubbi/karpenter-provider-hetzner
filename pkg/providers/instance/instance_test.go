@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
@@ -26,6 +27,7 @@ func (m *mockActionWaiter) WaitFor(_ context.Context, actions ...*hcloud.Action)
 
 // mockServerClient is a fake ServerClient for testing.
 type mockServerClient struct {
+	mu               sync.Mutex
 	servers          map[int64]*hcloud.Server
 	nextID           int64
 	deleted          []int64
@@ -45,6 +47,8 @@ func newMockServerClient() *mockServerClient {
 }
 
 func (m *mockServerClient) Create(_ context.Context, opts hcloud.ServerCreateOpts) (hcloud.ServerCreateResult, *hcloud.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.lastOpts = opts
 	if m.createErr != nil {
 		return hcloud.ServerCreateResult{}, nil, m.createErr
@@ -415,6 +419,8 @@ func TestCreate_WaitsForNextActions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 type mockPlacementGroupClient struct {
+	mu        sync.Mutex
+	listCalls int
 	groups    []*hcloud.PlacementGroup
 	nextID    int64
 	createErr error
@@ -429,6 +435,9 @@ func newMockPlacementGroupClient() *mockPlacementGroupClient {
 }
 
 func (m *mockPlacementGroupClient) AllWithOpts(_ context.Context, opts hcloud.PlacementGroupListOpts) ([]*hcloud.PlacementGroup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listCalls++
 	m.lastListOpts = opts
 	var result []*hcloud.PlacementGroup
 	for _, pg := range m.groups {
@@ -444,6 +453,8 @@ func (m *mockPlacementGroupClient) AllWithOpts(_ context.Context, opts hcloud.Pl
 }
 
 func (m *mockPlacementGroupClient) Create(_ context.Context, opts hcloud.PlacementGroupCreateOpts) (hcloud.PlacementGroupCreateResult, *hcloud.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.lastCreateOpts = opts
 	m.createCalls++
 	if m.createErr != nil {
@@ -592,5 +603,68 @@ func TestCreate_SpreadStrategy_EmptyNodePool(t *testing.T) {
 	}
 	if pgc.lastCreateOpts.Name != "karpenter-test-cluster" {
 		t.Errorf("expected PG name %q for empty NodePool, got %q", "karpenter-test-cluster", pgc.lastCreateOpts.Name)
+	}
+}
+
+// TestCreate_SpreadStrategy_ConcurrentCreatesShareOneGroup is the regression for
+// the get-or-create race (#69) and the per-create list call (#70): a burst of
+// concurrent creates for one pool must resolve the group exactly once.
+func TestCreate_SpreadStrategy_ConcurrentCreatesShareOneGroup(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	p := NewProviderWithPlacementGroups(sc, pgc, "test-cluster", nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := p.Create(context.Background(), CreateOpts{
+				Name: fmt.Sprintf("n-%d", i), ServerType: "cx22", Location: "nbg1",
+				Image: &hcloud.Image{ID: 1}, NodePool: "burst", PlacementGroupStrategy: "spread",
+			}); err != nil {
+				t.Errorf("create %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if pgc.createCalls != 1 {
+		t.Errorf("concurrent creates made %d placement groups, want 1", pgc.createCalls)
+	}
+	if pgc.listCalls != 1 {
+		t.Errorf("concurrent creates listed placement groups %d times, want 1", pgc.listCalls)
+	}
+	if len(pgc.groups) != 1 || sc.lastOpts.PlacementGroup.ID != pgc.groups[0].ID {
+		t.Errorf("servers did not all land in the one group")
+	}
+}
+
+// TestCreate_SpreadStrategy_ForgetsGroupOnNotFound checks a group deleted out of
+// band is resolved afresh instead of failing every create on a stale cached ID.
+func TestCreate_SpreadStrategy_ForgetsGroupOnNotFound(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	p := NewProviderWithPlacementGroups(sc, pgc, "test-cluster", nil)
+	opts := CreateOpts{Name: "n", ServerType: "cx22", Location: "nbg1", Image: &hcloud.Image{ID: 1}, NodePool: "pool"}
+
+	if _, err := p.Create(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	// The group disappears out of band; the next create fails on the stale ID.
+	pgc.groups = nil
+	sc.createErr = hcloud.Error{Code: hcloud.ErrorCodeNotFound, Message: "placement group not found"}
+	if _, err := p.Create(context.Background(), opts); err == nil {
+		t.Fatal("expected the create on a deleted group to fail")
+	}
+	sc.createErr = nil
+	if _, err := p.Create(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if pgc.createCalls != 2 {
+		t.Errorf("placement group created %d times, want 2 (once, then again after not_found)", pgc.createCalls)
+	}
+	if got := sc.lastOpts.PlacementGroup.ID; got != pgc.groups[0].ID {
+		t.Errorf("create used group %d, want the recreated group %d", got, pgc.groups[0].ID)
 	}
 }

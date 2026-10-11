@@ -15,10 +15,16 @@ import (
 type mockImageClient struct {
 	images   []*hcloud.Image
 	lastOpts hcloud.ImageListOpts
+	calls    int
+	err      error
 }
 
 func (m *mockImageClient) AllWithOpts(_ context.Context, opts hcloud.ImageListOpts) ([]*hcloud.Image, error) {
 	m.lastOpts = opts
+	m.calls++
+	if m.err != nil {
+		return nil, m.err
+	}
 	var result []*hcloud.Image
 	for _, img := range m.images {
 		// Filter by type if specified.
@@ -289,5 +295,68 @@ func TestResolveUbuntu_NoSelectorIgnoresSnapshots(t *testing.T) {
 	}})
 	if _, err := p.Resolve(context.Background(), apiv1.ImageSelector{Family: "ubuntu"}, hcloud.ArchitectureX86); err == nil {
 		t.Fatal("expected no match: snapshots need a label selector")
+	}
+}
+
+// TestResolve_CachesSuccessForTTL is the #70 regression: resolution was uncached
+// and cost a paginated list call per architecture per reconcile and per launch.
+func TestResolve_CachesSuccessForTTL(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	fc := &mockImageClient{images: []*hcloud.Image{
+		makeImage(1, hcloud.ImageTypeSystem, hcloud.ArchitectureX86, "Ubuntu 24.04", now),
+	}}
+	p := NewProvider(fc)
+	p.nowFn = func() time.Time { return now }
+	sel := apiv1.ImageSelector{Family: "ubuntu"}
+
+	for i := 0; i < 3; i++ {
+		img, err := p.Resolve(context.Background(), sel, hcloud.ArchitectureX86)
+		if err != nil || img.ID != 1 {
+			t.Fatalf("resolve %d: %v, %v", i, img, err)
+		}
+	}
+	if fc.calls != 1 {
+		t.Errorf("3 resolutions listed the catalogue %d times, want 1", fc.calls)
+	}
+
+	// A different selector or architecture is a different answer, not a hit.
+	_, _ = p.Resolve(context.Background(), apiv1.ImageSelector{Family: "ubuntu", Version: "22.04"}, hcloud.ArchitectureX86)
+	_, _ = p.Resolve(context.Background(), sel, hcloud.ArchitectureARM)
+	if fc.calls != 3 {
+		t.Errorf("distinct selectors/arches listed %d times in total, want 3", fc.calls)
+	}
+
+	// After the TTL a newer image is picked up.
+	fc.images = []*hcloud.Image{makeImage(2, hcloud.ImageTypeSystem, hcloud.ArchitectureX86, "Ubuntu 24.04", now)}
+	now = now.Add(resolveCacheTTL + time.Second)
+	img, err := p.Resolve(context.Background(), sel, hcloud.ArchitectureX86)
+	if err != nil || img.ID != 2 {
+		t.Errorf("after the TTL resolved %v (%v), want image 2", img, err)
+	}
+}
+
+// TestResolve_NeverCachesErrors checks neither a transient failure nor a definitive
+// miss is remembered: the next call must see the catalogue as it is now.
+func TestResolve_NeverCachesErrors(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	fc := &mockImageClient{err: errors.New("rate limited (429)")}
+	p := NewProvider(fc)
+	p.nowFn = func() time.Time { return now }
+	sel := apiv1.ImageSelector{Family: "ubuntu"}
+
+	if _, err := p.Resolve(context.Background(), sel, hcloud.ArchitectureX86); err == nil {
+		t.Fatal("expected the transient error")
+	}
+	fc.err = nil // catalogue readable but empty: a permanent miss
+	if _, err := p.Resolve(context.Background(), sel, hcloud.ArchitectureX86); !IsPermanent(err) {
+		t.Fatalf("expected a permanent miss, got %v", err)
+	}
+	fc.images = []*hcloud.Image{makeImage(7, hcloud.ImageTypeSystem, hcloud.ArchitectureX86, "Ubuntu 24.04", now)}
+	img, err := p.Resolve(context.Background(), sel, hcloud.ArchitectureX86)
+	if err != nil || img.ID != 7 {
+		t.Errorf("after the image appeared resolved %v (%v), want image 7", img, err)
+	}
+	if fc.calls != 3 {
+		t.Errorf("listed %d times, want 3 (no error was cached)", fc.calls)
 	}
 }

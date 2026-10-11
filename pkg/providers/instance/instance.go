@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
@@ -41,6 +42,14 @@ type Provider struct {
 	pgClient    PlacementGroupClient
 	waiter      ActionWaiter
 	clusterName string
+
+	// pgMu guards pgIDs and serializes placement-group resolution. Without it a
+	// scale-up burst ran one list+create pair per concurrent create on the same
+	// name, all saw an empty list, and all created a group (#69); with it the
+	// first create resolves the group and every other one reads the cached ID,
+	// which also drops a list call from every create (#70).
+	pgMu  sync.Mutex
+	pgIDs map[string]int64
 }
 
 // NewProvider returns a Provider that does NOT wait for hcloud actions to
@@ -94,9 +103,40 @@ func placementGroupName(clusterName, nodePool string) string {
 	return base + "-" + nodePool
 }
 
+// placementGroupID returns the ID of the spread placement group with the given
+// name, resolving it at most once per name: the name is deterministic per
+// (cluster, node pool), so the ID cannot change unless the group is deleted, and
+// forgetPlacementGroup handles that.
+func (p *Provider) placementGroupID(ctx context.Context, name string) (int64, error) {
+	p.pgMu.Lock()
+	defer p.pgMu.Unlock()
+	if id, ok := p.pgIDs[name]; ok {
+		return id, nil
+	}
+	id, err := p.getOrCreatePlacementGroup(ctx, name)
+	if err != nil {
+		return 0, err
+	}
+	if p.pgIDs == nil {
+		p.pgIDs = map[string]int64{}
+	}
+	p.pgIDs[name] = id
+	return id, nil
+}
+
+// forgetPlacementGroup drops a cached group ID, so the next create resolves the
+// group again. Called when a create fails in a way that may mean the cached group
+// no longer exists (deleted out of band).
+func (p *Provider) forgetPlacementGroup(name string) {
+	p.pgMu.Lock()
+	defer p.pgMu.Unlock()
+	delete(p.pgIDs, name)
+}
+
 // getOrCreatePlacementGroup finds an existing placement group of type spread
 // with the given name, creating it if it does not exist yet. It returns the
-// group's ID, or 0 and an error on failure.
+// group's ID, or 0 and an error on failure. Callers go through placementGroupID,
+// which serializes and caches this.
 func (p *Provider) getOrCreatePlacementGroup(ctx context.Context, name string) (int64, error) {
 	// AllWithOpts filters server-side by Name + Type, so a non-empty result is
 	// already the group we want.
@@ -200,9 +240,10 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 
 	// Apply placement group when strategy is "spread" (or empty, since spread
 	// is the kubebuilder default). Strategy "none" intentionally skips this.
+	var pgName string
 	if p.pgClient != nil && opts.PlacementGroupStrategy != "none" {
-		pgName := placementGroupName(p.clusterName, opts.NodePool)
-		pgID, err := p.getOrCreatePlacementGroup(ctx, pgName)
+		pgName = placementGroupName(p.clusterName, opts.NodePool)
+		pgID, err := p.placementGroupID(ctx, pgName)
 		if err != nil {
 			return nil, fmt.Errorf("resolving placement group: %w", err)
 		}
@@ -211,6 +252,11 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 
 	result, _, err := p.client.Create(ctx, createOpts)
 	if err != nil {
+		// A not_found with a placement group attached most likely means the cached
+		// group was deleted out of band; resolve it afresh on the next attempt.
+		if pgName != "" && hcloud.IsError(err, hcloud.ErrorCodeNotFound) {
+			p.forgetPlacementGroup(pgName)
+		}
 		return nil, MapCreateError(err)
 	}
 

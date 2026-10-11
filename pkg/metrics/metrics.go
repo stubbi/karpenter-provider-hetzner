@@ -91,6 +91,33 @@ var (
 		Help:      "Total number of image lookups that failed without proving the image absent.",
 	})
 
+	// rateLimit* mirror the hcloud RateLimit-* response headers. The hourly budget is
+	// per project and shared with every other client on the token (the cloud
+	// controller manager, the CSI driver), so when it runs out those fail too; these
+	// gauges are what points at the cause.
+	rateLimitLimit = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "karpenter_hetzner",
+		Name:      "hcloud_ratelimit_limit",
+		Help:      "hcloud API request budget per hour, from the last RateLimit-Limit header seen.",
+	})
+	rateLimitRemaining = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "karpenter_hetzner",
+		Name:      "hcloud_ratelimit_remaining",
+		Help:      "hcloud API requests remaining in the current budget, from the last RateLimit-Remaining header seen.",
+	})
+	rateLimitReset = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "karpenter_hetzner",
+		Name:      "hcloud_ratelimit_reset_timestamp_seconds",
+		Help:      "Unix time at which the hcloud API request budget is fully replenished, from the last RateLimit-Reset header seen.",
+	})
+
+	// imageCacheTotal counts image-resolution cache lookups by result (hit|miss).
+	imageCacheTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "karpenter_hetzner",
+		Name:      "image_cache_total",
+		Help:      "Total number of image-resolution cache lookups by result.",
+	}, []string{"result"})
+
 	// instanceTypeCacheTotal counts instance-type cache lookups by result
 	// (hit|miss|stale).
 	instanceTypeCacheTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -111,7 +138,27 @@ func init() {
 		instanceTypeCacheTotal,
 		selectionSkippedTotal,
 		imageResolutionErrorsTotal,
+		rateLimitLimit,
+		rateLimitRemaining,
+		rateLimitReset,
+		imageCacheTotal,
 	)
+}
+
+// RecordRateLimit records the hcloud request budget and what is left of it.
+func RecordRateLimit(limit, remaining float64) {
+	rateLimitLimit.Set(limit)
+	rateLimitRemaining.Set(remaining)
+}
+
+// RecordRateLimitReset records when the hcloud request budget resets (unix seconds).
+func RecordRateLimitReset(unix float64) {
+	rateLimitReset.Set(unix)
+}
+
+// RecordImageCache records an image-resolution cache lookup, result "hit" or "miss".
+func RecordImageCache(result string) {
+	imageCacheTotal.WithLabelValues(result).Inc()
 }
 
 // RecordServerCreate records a server create result and its duration.

@@ -197,6 +197,15 @@ comments explaining every field.
 | `METRICS_PORT` | no (8080) | Prometheus metrics port |
 | `HEALTH_PROBE_PORT` | no (8081) | Health/readiness probe port |
 
+### API budget
+
+Hetzner's hourly request budget is per **project** and shared with every client on the same token, including the cloud controller manager and the CSI driver, so when the provider exhausts it, load balancers and volume attaches fail too. The provider keeps its share small:
+
+- Action polling (the wait while a server boots) backs off from 1s to a 5s ceiling instead of the SDK's constant 500ms, roughly 6–8 requests per create instead of ~40.
+- Placement-group IDs are resolved once per node pool and cached; resolved images are cached for 5 minutes.
+
+`karpenter_hetzner_hcloud_ratelimit_remaining`, `karpenter_hetzner_hcloud_ratelimit_limit` and `karpenter_hetzner_hcloud_ratelimit_reset_timestamp_seconds` mirror the `RateLimit-*` headers of the provider's own requests. Alert on `remaining` falling toward zero; it is the signal that points at the budget when other components start failing at the same time. `karpenter_hetzner_image_cache_total{result}` shows the image cache hit rate.
+
 ## Cost notes
 
 - Pricing uses the **net** hourly figure, so relative comparisons match your Hetzner invoice (before VAT).

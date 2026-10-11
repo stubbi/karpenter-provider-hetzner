@@ -6,12 +6,29 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/metrics"
 )
+
+// resolveCacheTTL bounds how long a resolved image is reused before the catalogue
+// is listed again. Resolution was uncached and costs one to three paginated list
+// calls; it runs for every architecture on every NodeClass reconcile and on every
+// launch that falls back to a live lookup (#70). Five minutes matches the NodeClass
+// resync, so a newly uploaded snapshot is picked up within one or two resyncs,
+// while a scale-up burst or a fleet of NodeClasses sharing a selector costs one
+// lookup per TTL instead of one per caller.
+const resolveCacheTTL = 5 * time.Minute
+
+type cachedImage struct {
+	image   hcloud.Image
+	expires time.Time
+}
 
 // labelSelectorString renders an hcloud label selector from a map (sorted for
 // determinism). hcloud label keys and values are restricted to [a-zA-Z0-9._-]
@@ -63,16 +80,51 @@ type ImageClient interface {
 // Provider resolves OS images from an HCloudNodeClass ImageSelector.
 type Provider struct {
 	client ImageClient
+
+	mu    sync.Mutex
+	cache map[string]cachedImage
+	nowFn func() time.Time
 }
 
 // NewProvider creates a new image family provider.
 func NewProvider(client ImageClient) *Provider {
-	return &Provider{client: client}
+	return &Provider{client: client, cache: map[string]cachedImage{}, nowFn: time.Now}
+}
+
+// cacheKey identifies everything a resolution depends on.
+func cacheKey(selector apiv1.ImageSelector, arch hcloud.Architecture) string {
+	return strings.Join([]string{strings.ToLower(selector.Family), selector.Version, labelSelectorString(selector.Selector), string(arch)}, "\x00")
 }
 
 // Resolve returns the best matching image for the given selector and architecture.
 // Supported families: "ubuntu", "talos".
+//
+// Successful resolutions are cached for resolveCacheTTL. Errors are never cached:
+// a transient one must be retried, and a permanent one ("no such image") must be
+// re-checked so an image uploaded to fix it is found on the next attempt.
 func (p *Provider) Resolve(ctx context.Context, selector apiv1.ImageSelector, arch hcloud.Architecture) (*hcloud.Image, error) {
+	key := cacheKey(selector, arch)
+	p.mu.Lock()
+	entry, ok := p.cache[key]
+	p.mu.Unlock()
+	if ok && p.nowFn().Before(entry.expires) {
+		metrics.RecordImageCache("hit")
+		img := entry.image
+		return &img, nil
+	}
+	metrics.RecordImageCache("miss")
+	img, err := p.resolve(ctx, selector, arch)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	p.cache[key] = cachedImage{image: *img, expires: p.nowFn().Add(resolveCacheTTL)}
+	p.mu.Unlock()
+	return img, nil
+}
+
+// resolve is the uncached lookup behind Resolve.
+func (p *Provider) resolve(ctx context.Context, selector apiv1.ImageSelector, arch hcloud.Architecture) (*hcloud.Image, error) {
 	log := logf.FromContext(ctx)
 	ls := labelSelectorString(selector.Selector)
 	var img *hcloud.Image
