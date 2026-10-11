@@ -37,6 +37,10 @@ const (
 	DriftServerType karpcp.DriftReason = "ServerTypeDrift"
 	DriftLocation   karpcp.DriftReason = "LocationDrift"
 	DriftLabels     karpcp.DriftReason = "LabelsDrift"
+	// DriftNodeClass reports an edit to a NodeClass field a running server cannot
+	// report back (userData, its Secret reference, SSH keys, placement strategy,
+	// public IPs), detected by comparing the NodeClaim's recorded hash.
+	DriftNodeClass karpcp.DriftReason = "NodeClassDrift"
 )
 
 // CloudProvider implements the Karpenter CloudProvider interface for Hetzner Cloud.
@@ -348,6 +352,15 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	// Build the hydrated NodeClaim.
 	created := nodeClaim.DeepCopy()
 	created.Labels = labels
+	// Record the hash of the node class this server was built from. Computed from the
+	// spec actually used above rather than copied from the NodeClass annotation, which
+	// may still describe the previous spec if the hash controller has not caught up:
+	// core persists these annotations onto the NodeClaim (PopulateNodeClaimDetails).
+	if created.Annotations == nil {
+		created.Annotations = map[string]string{}
+	}
+	created.Annotations[apiv1.AnnotationNodeClassHash] = nodeClass.Hash()
+	created.Annotations[apiv1.AnnotationNodeClassHashVersion] = apiv1.NodeClassHashVersion
 	created.Status.ProviderID = instance.FormatProviderID(server.ID)
 	created.Status.Capacity = selected.Capacity
 	created.Status.Allocatable = selected.Allocatable()
@@ -464,13 +477,19 @@ func (cp *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCl
 		return reason
 	}
 
-	// Check image drift: compare the resolved image ID recorded in NodeClaim status against
-	// the current server image.
-	if nodeClaim.Status.ImageID != "" && server.Image != nil {
-		currentImageID := strconv.FormatInt(server.Image.ID, 10)
-		if nodeClaim.Status.ImageID != currentImageID {
-			return logDrift(DriftImage, nodeClaim.Status.ProviderID), nil
-		}
+	// Image drift: the image this node was launched from against the image the NodeClass
+	// resolves to now, for the node's architecture. Only when the selector pins
+	// (version or label selector): a bare selector means "newest, whatever that is", and
+	// chasing it would roll the fleet on any matching snapshot upload, including one from
+	// an unrelated pipeline.
+	if imageDrifted(nodeClass, nodeClaim) {
+		return logDrift(DriftImage, nodeClaim.Status.ProviderID), nil
+	}
+
+	// NodeClass drift: the fields a running server cannot report back, compared as
+	// intent against intent through the hash recorded at launch.
+	if nodeClassHashDrifted(nodeClass, nodeClaim) {
+		return logDrift(DriftNodeClass, nodeClaim.Status.ProviderID), nil
 	}
 
 	// Check network drift: ensure the server is attached to the expected network.
@@ -542,11 +561,57 @@ func (cp *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCl
 		}
 	}
 
-	// SSH-key and user-data drift are intentionally not checked: Hetzner does not
-	// reliably expose applied SSH keys or user-data after create, so a comparison
-	// would produce false positives. They are omitted rather than faked.
+	// SSH keys, userData and the other fields Hetzner does not expose after create are
+	// not read back from the server; the NodeClass hash above covers them.
 
 	return "", nil
+}
+
+// imagePinned reports whether the selector names a deliberate image: a version or a
+// label selector. Only then can "the image the NodeClass resolves to" change by intent.
+func imagePinned(sel apiv1.ImageSelector) bool {
+	return sel.Version != "" || len(sel.Selector) > 0
+}
+
+// imageDrifted compares the NodeClaim's launch image against the image the NodeClass
+// currently resolves for the node's architecture. It reports no drift whenever it
+// cannot be sure: an unpinned selector, a NodeClaim without a recorded image or
+// architecture, or a NodeClass whose status has not been resolved for its current
+// generation (CurrentResolvedImages returns nil until the controller catches up, so a
+// repin is never compared against the previous selector's answer).
+func imageDrifted(nodeClass *apiv1.HCloudNodeClass, nodeClaim *karpv1.NodeClaim) bool {
+	if !imagePinned(nodeClass.Spec.ImageSelector) || nodeClaim.Status.ImageID == "" {
+		return false
+	}
+	var arch hcloud.Architecture
+	switch nodeClaim.Labels[corev1.LabelArchStable] {
+	case "amd64":
+		arch = hcloud.ArchitectureX86
+	case "arm64":
+		arch = hcloud.ArchitectureARM
+	default:
+		return false
+	}
+	for _, ri := range nodeClass.CurrentResolvedImages() {
+		if ri.Architecture == string(arch) {
+			return strconv.FormatInt(ri.ImageID, 10) != nodeClaim.Status.ImageID
+		}
+	}
+	return false
+}
+
+// nodeClassHashDrifted compares the hash recorded on the NodeClaim at launch with the
+// NodeClass's current spec. A NodeClaim with no hash, or one produced by a different
+// hashing scheme, is not drifted: that is every NodeClaim launched before this check
+// existed, and treating them as drifted would replace every node in the cluster on
+// upgrade. The hash controller re-stamps those NodeClaims with the current hash, so the
+// next edit after that is detected.
+func nodeClassHashDrifted(nodeClass *apiv1.HCloudNodeClass, nodeClaim *karpv1.NodeClaim) bool {
+	recorded, ok := nodeClaim.Annotations[apiv1.AnnotationNodeClassHash]
+	if !ok || nodeClaim.Annotations[apiv1.AnnotationNodeClassHashVersion] != apiv1.NodeClassHashVersion {
+		return false
+	}
+	return recorded != nodeClass.Hash()
 }
 
 // resolveUserData returns the userData for a NodeClass, reading it from the

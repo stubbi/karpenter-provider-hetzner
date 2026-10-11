@@ -75,7 +75,12 @@ func main() {
 	// Our NodeClass status controller (network + image validation, Ready).
 	nodeClassController := nodeclass.NewController(op.GetClient(), &hcloudClient.Network, &hcloudClient.Location, &hcloudClient.Firewall, &hcloudClient.SSHKey, imageProvider)
 
-	providerControllers := []controller.Controller{nodeClassController}
+	providerControllers := []controller.Controller{
+		nodeClassController,
+		// Keeps the NodeClass hash current and stamps NodeClaims launched before it
+		// existed, so NodeClass drift never rolls a fleet on upgrade.
+		nodeclass.NewHashController(op.GetClient()),
+	}
 	if cfg.OrphanGCEnabled {
 		// Reclaims servers created for a NodeClaim that no longer exists and that
 		// never became a Node (#61). Core has no owner for that direction.
