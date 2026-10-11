@@ -28,6 +28,7 @@ type ServerClient interface {
 // PlacementGroupClient is the narrow interface for the hcloud placement groups API.
 type PlacementGroupClient interface {
 	AllWithOpts(ctx context.Context, opts hcloud.PlacementGroupListOpts) ([]*hcloud.PlacementGroup, error)
+	GetByID(ctx context.Context, id int64) (*hcloud.PlacementGroup, *hcloud.Response, error)
 	Create(ctx context.Context, opts hcloud.PlacementGroupCreateOpts) (hcloud.PlacementGroupCreateResult, *hcloud.Response, error)
 }
 
@@ -43,13 +44,14 @@ type Provider struct {
 	waiter      ActionWaiter
 	clusterName string
 
-	// pgMu guards pgIDs and serializes placement-group resolution. Without it a
+	// pgMu guards pgPools and serializes placement-group allocation. Without it a
 	// scale-up burst ran one list+create pair per concurrent create on the same
 	// name, all saw an empty list, and all created a group (#69); with it the
-	// first create resolves the group and every other one reads the cached ID,
-	// which also drops a list call from every create (#70).
-	pgMu  sync.Mutex
-	pgIDs map[string]int64
+	// first create resolves the pool's groups and every other one reads the
+	// cache, which also drops a list call from every create (#70).
+	pgMu    sync.Mutex
+	pgPools map[string]*pgPool
+	nowFn   func() time.Time
 }
 
 // NewProvider returns a Provider that does NOT wait for hcloud actions to
@@ -87,8 +89,11 @@ type CreateOpts struct {
 	NodeClaim              string
 	NodePool               string
 	PlacementGroupStrategy string
-	EnablePublicIPv4       bool
-	EnablePublicIPv6       bool
+	// PlacementGroupIDs, when set, are the operator-managed spread groups to place
+	// servers in instead of the provider-managed ones.
+	PlacementGroupIDs []int64
+	EnablePublicIPv4  bool
+	EnablePublicIPv6  bool
 }
 
 // placementGroupName returns the deterministic placement group name for a node
@@ -101,64 +106,6 @@ func placementGroupName(clusterName, nodePool string) string {
 		return base
 	}
 	return base + "-" + nodePool
-}
-
-// placementGroupID returns the ID of the spread placement group with the given
-// name, resolving it at most once per name: the name is deterministic per
-// (cluster, node pool), so the ID cannot change unless the group is deleted, and
-// forgetPlacementGroup handles that.
-func (p *Provider) placementGroupID(ctx context.Context, name string) (int64, error) {
-	p.pgMu.Lock()
-	defer p.pgMu.Unlock()
-	if id, ok := p.pgIDs[name]; ok {
-		return id, nil
-	}
-	id, err := p.getOrCreatePlacementGroup(ctx, name)
-	if err != nil {
-		return 0, err
-	}
-	if p.pgIDs == nil {
-		p.pgIDs = map[string]int64{}
-	}
-	p.pgIDs[name] = id
-	return id, nil
-}
-
-// forgetPlacementGroup drops a cached group ID, so the next create resolves the
-// group again. Called when a create fails in a way that may mean the cached group
-// no longer exists (deleted out of band).
-func (p *Provider) forgetPlacementGroup(name string) {
-	p.pgMu.Lock()
-	defer p.pgMu.Unlock()
-	delete(p.pgIDs, name)
-}
-
-// getOrCreatePlacementGroup finds an existing placement group of type spread
-// with the given name, creating it if it does not exist yet. It returns the
-// group's ID, or 0 and an error on failure. Callers go through placementGroupID,
-// which serializes and caches this.
-func (p *Provider) getOrCreatePlacementGroup(ctx context.Context, name string) (int64, error) {
-	// AllWithOpts filters server-side by Name + Type, so a non-empty result is
-	// already the group we want.
-	existing, err := p.pgClient.AllWithOpts(ctx, hcloud.PlacementGroupListOpts{
-		Name: name,
-		Type: hcloud.PlacementGroupTypeSpread,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("listing placement groups: %w", err)
-	}
-	if len(existing) > 0 {
-		return existing[0].ID, nil
-	}
-
-	result, _, err := p.pgClient.Create(ctx, hcloud.PlacementGroupCreateOpts{
-		Name: name,
-		Type: hcloud.PlacementGroupTypeSpread,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("creating placement group %q: %w", name, err)
-	}
-	return result.PlacementGroup.ID, nil
 }
 
 // Create provisions a new Hetzner server, merging Karpenter management labels.
@@ -238,24 +185,50 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 		EnableIPv6: opts.EnablePublicIPv6,
 	}
 
-	// Apply placement group when strategy is "spread" (or empty, since spread
-	// is the kubebuilder default). Strategy "none" intentionally skips this.
-	var pgName string
-	if p.pgClient != nil && opts.PlacementGroupStrategy != "none" {
-		pgName = placementGroupName(p.clusterName, opts.NodePool)
-		pgID, err := p.placementGroupID(ctx, pgName)
-		if err != nil {
-			return nil, fmt.Errorf("resolving placement group: %w", err)
+	// Apply a placement group when strategy is "spread" (or empty, since spread
+	// is the kubebuilder default), or when the NodeClass names its own groups.
+	// Strategy "none" without explicit groups intentionally skips this.
+	usePG := p.pgClient != nil && (len(opts.PlacementGroupIDs) > 0 || opts.PlacementGroupStrategy != "none")
+	excluded := map[int64]bool{}
+	var result hcloud.ServerCreateResult
+	for attempt := 0; ; attempt++ {
+		var pgID int64
+		var pgKey string
+		if usePG {
+			var err error
+			pgID, pgKey, err = p.acquirePlacementGroup(ctx, opts, excluded)
+			if err != nil {
+				return nil, fmt.Errorf("resolving placement group: %w", err)
+			}
+			createOpts.PlacementGroup = &hcloud.PlacementGroup{ID: pgID}
 		}
-		createOpts.PlacementGroup = &hcloud.PlacementGroup{ID: pgID}
-	}
 
-	result, _, err := p.client.Create(ctx, createOpts)
-	if err != nil {
-		// A not_found with a placement group attached most likely means the cached
-		// group was deleted out of band; resolve it afresh on the next attempt.
-		if pgName != "" && hcloud.IsError(err, hcloud.ErrorCodeNotFound) {
-			p.forgetPlacementGroup(pgName)
+		var err error
+		result, _, err = p.client.Create(ctx, createOpts)
+		if err == nil {
+			break
+		}
+		if usePG {
+			switch {
+			case hcloud.IsError(err, hcloud.ErrorCodePlacementError):
+				// The group is full (or cannot take this server). Counts are
+				// checked before every create, but concurrent creates race past
+				// that check, so overflow has to be handled here too: mark the
+				// group full and try once more with another one.
+				p.markPlacementGroupFull(pgKey, pgID)
+				if attempt == 0 {
+					excluded[pgID] = true
+					log.Info("placement group refused the server; retrying with another group",
+						"name", opts.Name, "placementGroupID", pgID)
+					continue
+				}
+			case hcloud.IsError(err, hcloud.ErrorCodeNotFound):
+				// Most likely a cached group was deleted out of band; re-read the
+				// pool on the next attempt.
+				p.forgetPlacementGroups(pgKey)
+			default:
+				p.releasePlacementGroup(pgKey, pgID)
+			}
 		}
 		return nil, MapCreateError(err)
 	}

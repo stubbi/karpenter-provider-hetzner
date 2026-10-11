@@ -37,6 +37,10 @@ type mockServerClient struct {
 	createErr        error
 	deleteErr        error
 	lastOpts         hcloud.ServerCreateOpts
+	createCalls      int
+	// pgs, when set, makes Create enforce spread-group capacity the way hcloud
+	// does: a create into a full group fails with placement_error.
+	pgs *mockPlacementGroupClient
 }
 
 func newMockServerClient() *mockServerClient {
@@ -50,10 +54,16 @@ func (m *mockServerClient) Create(_ context.Context, opts hcloud.ServerCreateOpt
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastOpts = opts
+	m.createCalls++
 	if m.createErr != nil {
 		return hcloud.ServerCreateResult{}, nil, m.createErr
 	}
 	id := m.nextID
+	if m.pgs != nil && opts.PlacementGroup != nil {
+		if err := m.pgs.addServer(opts.PlacementGroup.ID, id); err != nil {
+			return hcloud.ServerCreateResult{}, nil, err
+		}
+	}
 	m.nextID++
 	server := &hcloud.Server{ID: id, Name: opts.Name, Labels: opts.Labels, ServerType: opts.ServerType, Location: opts.Location}
 	m.servers[id] = server
@@ -421,6 +431,7 @@ func TestCreate_WaitsForNextActions(t *testing.T) {
 type mockPlacementGroupClient struct {
 	mu        sync.Mutex
 	listCalls int
+	getCalls  int
 	groups    []*hcloud.PlacementGroup
 	nextID    int64
 	createErr error
@@ -447,9 +458,60 @@ func (m *mockPlacementGroupClient) AllWithOpts(_ context.Context, opts hcloud.Pl
 		if opts.Type != "" && pg.Type != opts.Type {
 			continue
 		}
-		result = append(result, pg)
+		if !matchesSelector(pg.Labels, opts.LabelSelector) {
+			continue
+		}
+		cp := *pg
+		cp.Servers = append([]int64(nil), pg.Servers...)
+		result = append(result, &cp)
 	}
 	return result, nil
+}
+
+// matchesSelector evaluates an equality-only hcloud label selector ("a=b,c=d").
+func matchesSelector(labels map[string]string, selector string) bool {
+	if selector == "" {
+		return true
+	}
+	for _, term := range strings.Split(selector, ",") {
+		k, v, _ := strings.Cut(term, "=")
+		if got, ok := labels[k]; !ok || got != v {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *mockPlacementGroupClient) GetByID(_ context.Context, id int64) (*hcloud.PlacementGroup, *hcloud.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getCalls++
+	for _, pg := range m.groups {
+		if pg.ID == id {
+			cp := *pg
+			cp.Servers = append([]int64(nil), pg.Servers...)
+			return &cp, nil, nil
+		}
+	}
+	return nil, nil, nil
+}
+
+// addServer records a server in a group, refusing it once the group holds
+// spreadGroupMaxServers, as hcloud does.
+func (m *mockPlacementGroupClient) addServer(groupID, serverID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, pg := range m.groups {
+		if pg.ID != groupID {
+			continue
+		}
+		if len(pg.Servers) >= spreadGroupMaxServers {
+			return hcloud.Error{Code: hcloud.ErrorCodePlacementError, Message: "placement group is full"}
+		}
+		pg.Servers = append(pg.Servers, serverID)
+		return nil
+	}
+	return hcloud.Error{Code: hcloud.ErrorCodeNotFound, Message: "placement group not found"}
 }
 
 func (m *mockPlacementGroupClient) Create(_ context.Context, opts hcloud.PlacementGroupCreateOpts) (hcloud.PlacementGroupCreateResult, *hcloud.Response, error) {
@@ -460,9 +522,14 @@ func (m *mockPlacementGroupClient) Create(_ context.Context, opts hcloud.Placeme
 	if m.createErr != nil {
 		return hcloud.PlacementGroupCreateResult{}, nil, m.createErr
 	}
+	for _, pg := range m.groups {
+		if pg.Name == opts.Name {
+			return hcloud.PlacementGroupCreateResult{}, nil, hcloud.Error{Code: hcloud.ErrorCodeUniquenessError, Message: "name is already used"}
+		}
+	}
 	id := m.nextID
 	m.nextID++
-	pg := &hcloud.PlacementGroup{ID: id, Name: opts.Name, Type: opts.Type}
+	pg := &hcloud.PlacementGroup{ID: id, Name: opts.Name, Type: opts.Type, Labels: opts.Labels}
 	m.groups = append(m.groups, pg)
 	return hcloud.PlacementGroupCreateResult{PlacementGroup: pg}, nil, nil
 }
@@ -615,7 +682,7 @@ func TestCreate_SpreadStrategy_ConcurrentCreatesShareOneGroup(t *testing.T) {
 	p := NewProviderWithPlacementGroups(sc, pgc, "test-cluster", nil)
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for i := 0; i < spreadGroupMaxServers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -632,8 +699,9 @@ func TestCreate_SpreadStrategy_ConcurrentCreatesShareOneGroup(t *testing.T) {
 	if pgc.createCalls != 1 {
 		t.Errorf("concurrent creates made %d placement groups, want 1", pgc.createCalls)
 	}
-	if pgc.listCalls != 1 {
-		t.Errorf("concurrent creates listed placement groups %d times, want 1", pgc.listCalls)
+	// One refresh of the pool: the legacy by-name lookup plus the labelled list.
+	if pgc.listCalls != 2 {
+		t.Errorf("concurrent creates listed placement groups %d times, want 2 (one refresh)", pgc.listCalls)
 	}
 	if len(pgc.groups) != 1 || sc.lastOpts.PlacementGroup.ID != pgc.groups[0].ID {
 		t.Errorf("servers did not all land in the one group")
@@ -666,5 +734,205 @@ func TestCreate_SpreadStrategy_ForgetsGroupOnNotFound(t *testing.T) {
 	}
 	if got := sc.lastOpts.PlacementGroup.ID; got != pgc.groups[0].ID {
 		t.Errorf("create used group %d, want the recreated group %d", got, pgc.groups[0].ID)
+	}
+}
+
+func spreadOpts(name, pool string) CreateOpts {
+	return CreateOpts{Name: name, ServerType: "cx22", Location: "nbg1", Image: &hcloud.Image{ID: 1}, NodePool: pool, PlacementGroupStrategy: "spread"}
+}
+
+// groupSizes returns the member count of every group, keyed by name.
+func groupSizes(pgc *mockPlacementGroupClient) map[string]int {
+	out := map[string]int{}
+	for _, g := range pgc.groups {
+		out[g.Name] = len(g.Servers)
+	}
+	return out
+}
+
+// TestCreate_SpreadStrategy_RollsOverToIndexedGroups is the #69 ceiling: a pool
+// larger than one spread group used to stop scaling at the group's cap.
+func TestCreate_SpreadStrategy_RollsOverToIndexedGroups(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	sc.pgs = pgc
+	p := NewProviderWithPlacementGroups(sc, pgc, "c", nil)
+
+	for i := 0; i < 25; i++ {
+		if _, err := p.Create(context.Background(), spreadOpts(fmt.Sprintf("n-%d", i), "pool")); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+	want := map[string]int{"karpenter-c-pool": 10, "karpenter-c-pool-1": 10, "karpenter-c-pool-2": 5}
+	if got := groupSizes(pgc); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("group sizes %v, want %v", got, want)
+	}
+	for _, g := range pgc.groups {
+		if g.Labels[LabelPlacementGroupIndex] == "" || g.Labels[apiv1.ServerLabelNodePool] != "pool" ||
+			g.Labels[apiv1.ServerLabelCluster] != "c" {
+			t.Errorf("group %s is not labelled for its pool: %v", g.Name, g.Labels)
+		}
+	}
+}
+
+// TestCreate_SpreadStrategy_PicksLeastFullGroup checks freed slots are reused,
+// least-full first, instead of piling into one group or creating another.
+func TestCreate_SpreadStrategy_PicksLeastFullGroup(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	sc.pgs = pgc
+	pgc.groups = []*hcloud.PlacementGroup{
+		{ID: 1, Name: "karpenter-c-pool", Type: hcloud.PlacementGroupTypeSpread, Servers: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
+		{ID: 2, Name: "karpenter-c-pool-1", Type: hcloud.PlacementGroupTypeSpread, Servers: []int64{11, 12, 13, 14, 15, 16, 17},
+			Labels: map[string]string{apiv1.ServerLabelManagedBy: "karpenter", apiv1.ServerLabelCluster: "c", apiv1.ServerLabelNodePool: "pool", LabelPlacementGroupIndex: "1"}},
+		{ID: 3, Name: "karpenter-c-pool-2", Type: hcloud.PlacementGroupTypeSpread, Servers: []int64{18, 19},
+			Labels: map[string]string{apiv1.ServerLabelManagedBy: "karpenter", apiv1.ServerLabelCluster: "c", apiv1.ServerLabelNodePool: "pool", LabelPlacementGroupIndex: "2"}},
+	}
+	p := NewProviderWithPlacementGroups(sc, pgc, "c", nil)
+
+	if _, err := p.Create(context.Background(), spreadOpts("n", "pool")); err != nil {
+		t.Fatal(err)
+	}
+	if got := sc.lastOpts.PlacementGroup.ID; got != 3 {
+		t.Errorf("server went into group %d, want the least-full group 3", got)
+	}
+	if pgc.createCalls != 0 {
+		t.Errorf("created %d groups while existing ones had room", pgc.createCalls)
+	}
+}
+
+// TestCreate_SpreadStrategy_IgnoresOtherPoolsGroups checks the node pool label
+// keeps pool "a"'s overflow groups and pool "a-1"'s groups apart, although
+// karpenter-c-a-1 would be a valid name for both.
+func TestCreate_SpreadStrategy_IgnoresOtherPoolsGroups(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	sc.pgs = pgc
+	pgc.groups = []*hcloud.PlacementGroup{
+		{ID: 7, Name: "karpenter-c-a-1", Type: hcloud.PlacementGroupTypeSpread,
+			Labels: map[string]string{apiv1.ServerLabelManagedBy: "karpenter", apiv1.ServerLabelCluster: "c", apiv1.ServerLabelNodePool: "a-1", LabelPlacementGroupIndex: "0"}},
+	}
+	p := NewProviderWithPlacementGroups(sc, pgc, "c", nil)
+
+	if _, err := p.Create(context.Background(), spreadOpts("n", "a")); err != nil {
+		t.Fatal(err)
+	}
+	if got := sc.lastOpts.PlacementGroup.ID; got == 7 {
+		t.Error("pool a placed a server in pool a-1's group")
+	}
+}
+
+// TestCreate_SpreadStrategy_OverflowOnCreateError is the race the owner asked to
+// see as a test: the chosen group fills between the count and the create (another
+// controller, or a create the cache did not see), hcloud answers placement_error,
+// and the provider must move to another group rather than fail or retry the same.
+func TestCreate_SpreadStrategy_OverflowOnCreateError(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	sc.pgs = pgc
+	p := NewProviderWithPlacementGroups(sc, pgc, "c", nil)
+
+	if _, err := p.Create(context.Background(), spreadOpts("first", "pool")); err != nil {
+		t.Fatal(err)
+	}
+	// The group fills behind the cache's back: it believes one member.
+	for id := int64(1000); len(pgc.groups[0].Servers) < spreadGroupMaxServers; id++ {
+		pgc.groups[0].Servers = append(pgc.groups[0].Servers, id)
+	}
+
+	server, err := p.Create(context.Background(), spreadOpts("second", "pool"))
+	if err != nil {
+		t.Fatalf("create after the group filled: %v", err)
+	}
+	if server == nil || sc.lastOpts.PlacementGroup.ID == pgc.groups[0].ID {
+		t.Fatalf("server landed in the full group")
+	}
+	if len(pgc.groups) != 2 || len(pgc.groups[1].Servers) != 1 {
+		t.Errorf("want the server in a new overflow group, groups: %v", groupSizes(pgc))
+	}
+	if sc.createCalls != 3 {
+		t.Errorf("server create called %d times, want 3 (first, refused, retried)", sc.createCalls)
+	}
+
+	// The full group stays marked full: the next create goes straight to group 1.
+	before := sc.createCalls
+	if _, err := p.Create(context.Background(), spreadOpts("third", "pool")); err != nil {
+		t.Fatal(err)
+	}
+	if sc.createCalls-before != 1 || sc.lastOpts.PlacementGroup.ID != pgc.groups[1].ID {
+		t.Errorf("third create was not sent straight to the overflow group")
+	}
+}
+
+// TestCreate_SpreadStrategy_OverflowRetriesOnlyOnce bounds the retry: a second
+// placement_error is returned, not looped on.
+func TestCreate_SpreadStrategy_OverflowRetriesOnlyOnce(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	p := NewProviderWithPlacementGroups(sc, pgc, "c", nil)
+	sc.createErr = hcloud.Error{Code: hcloud.ErrorCodePlacementError, Message: "placement failed"}
+
+	if _, err := p.Create(context.Background(), spreadOpts("n", "pool")); err == nil {
+		t.Fatal("expected the second placement_error to be returned")
+	}
+	if sc.createCalls != 2 {
+		t.Errorf("server create called %d times, want 2", sc.createCalls)
+	}
+}
+
+// TestCreate_ExplicitPlacementGroupIDs checks operator-managed groups are used
+// instead of provider-managed ones, least-full first, and never added to.
+func TestCreate_ExplicitPlacementGroupIDs(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	sc.pgs = pgc
+	pgc.groups = []*hcloud.PlacementGroup{
+		{ID: 41, Name: "tf-a", Type: hcloud.PlacementGroupTypeSpread, Servers: []int64{1, 2, 3}},
+		{ID: 42, Name: "tf-b", Type: hcloud.PlacementGroupTypeSpread, Servers: []int64{4}},
+	}
+	p := NewProviderWithPlacementGroups(sc, pgc, "c", nil)
+	opts := spreadOpts("n", "pool")
+	opts.PlacementGroupIDs = []int64{41, 42}
+
+	if _, err := p.Create(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := sc.lastOpts.PlacementGroup.ID; got != 42 {
+		t.Errorf("server went into group %d, want the least-full explicit group 42", got)
+	}
+
+	// Fill both; the provider must refuse rather than create a group of its own.
+	for _, g := range pgc.groups {
+		for id := int64(100 * g.ID); len(g.Servers) < spreadGroupMaxServers; id++ {
+			g.Servers = append(g.Servers, id)
+		}
+	}
+	p.forgetPlacementGroups(pgPoolKey(opts, ""))
+	_, err := p.Create(context.Background(), opts)
+	if !errors.Is(err, ErrPlacementGroupsFull) {
+		t.Errorf("full explicit groups: err = %v, want ErrPlacementGroupsFull", err)
+	}
+	if pgc.createCalls != 0 {
+		t.Errorf("provider created %d groups although spec.placementGroupIDs is set", pgc.createCalls)
+	}
+}
+
+// TestCreate_ExplicitPlacementGroupIDs_WithStrategyNone checks explicit groups
+// apply even when the strategy is none (admission rejects the combination, but
+// the provider must not silently drop the operator's groups if it gets through).
+func TestCreate_ExplicitPlacementGroupIDs_WithStrategyNone(t *testing.T) {
+	sc := newMockServerClient()
+	pgc := newMockPlacementGroupClient()
+	pgc.groups = []*hcloud.PlacementGroup{{ID: 41, Name: "tf-a", Type: hcloud.PlacementGroupTypeSpread}}
+	p := NewProviderWithPlacementGroups(sc, pgc, "c", nil)
+	opts := spreadOpts("n", "pool")
+	opts.PlacementGroupStrategy = "none"
+	opts.PlacementGroupIDs = []int64{41}
+
+	if _, err := p.Create(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if sc.lastOpts.PlacementGroup == nil || sc.lastOpts.PlacementGroup.ID != 41 {
+		t.Errorf("explicit group not applied: %v", sc.lastOpts.PlacementGroup)
 	}
 }

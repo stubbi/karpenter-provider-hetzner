@@ -25,6 +25,7 @@ type HCloudNodeClass struct {
 	Status            HCloudNodeClassStatus `json:"status,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:message="placementGroupIDs cannot be combined with placementGroupStrategy none",rule="!has(self.placementGroupIDs) || !has(self.placementGroupStrategy) || self.placementGroupStrategy != 'none'"
 type HCloudNodeClassSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	Locations []string `json:"locations"`
@@ -40,10 +41,33 @@ type HCloudNodeClassSpec struct {
 	// +optional
 	SSHKeyIDs []int64 `json:"sshKeyIDs,omitempty"`
 
+	// PlacementGroupStrategy controls placement groups for provider-managed
+	// placement. "spread" (the default) places each node pool's servers in spread
+	// placement groups the provider creates and names after the cluster and node
+	// pool. Hetzner admits at most 10 servers into one spread group, so a larger
+	// pool rolls over to additional indexed groups (<name>-1, <name>-2, ...),
+	// filling the least-full group first. The spread guarantee holds only WITHIN a
+	// group: nodes in different groups may share a physical host, so anti-affinity
+	// degrades gradually with pool size rather than all at once. "none" disables
+	// placement groups.
 	// +kubebuilder:default=spread
 	// +kubebuilder:validation:Enum=spread;none
 	// +optional
 	PlacementGroupStrategy string `json:"placementGroupStrategy,omitempty"`
+
+	// PlacementGroupIDs are existing spread placement groups (for example managed
+	// in Terraform) to place servers in instead of provider-managed ones. Servers
+	// go into the least-full listed group with room; the provider never creates,
+	// deletes or adds groups to this list, and a launch fails when every listed
+	// group is full (10 servers each). As with provider-managed groups, spread
+	// holds only within each group. Cannot be combined with
+	// placementGroupStrategy "none".
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=50
+	// +kubebuilder:validation:items:Minimum=1
+	// +listType=set
+	// +optional
+	PlacementGroupIDs []int64 `json:"placementGroupIDs,omitempty"`
 
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`

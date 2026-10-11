@@ -87,6 +87,11 @@ func (in *HCloudNodeClassSpec) DeepCopyInto(out *HCloudNodeClassSpec) {
 		*out = make([]int64, len(*in))
 		copy(*out, *in)
 	}
+	if in.PlacementGroupIDs != nil {
+		in, out := &in.PlacementGroupIDs, &out.PlacementGroupIDs
+		*out = make([]int64, len(*in))
+		copy(*out, *in)
+	}
 	if in.Labels != nil {
 		in, out := &in.Labels, &out.Labels
 		*out = make(map[string]string, len(*in))

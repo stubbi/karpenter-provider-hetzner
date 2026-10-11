@@ -165,8 +165,35 @@ spec:
                 format: int64
                 minimum: 1
                 type: integer
+              placementGroupIDs:
+                description: |-
+                  PlacementGroupIDs are existing spread placement groups (for example managed
+                  in Terraform) to place servers in instead of provider-managed ones. Servers
+                  go into the least-full listed group with room; the provider never creates,
+                  deletes or adds groups to this list, and a launch fails when every listed
+                  group is full (10 servers each). As with provider-managed groups, spread
+                  holds only within each group. Cannot be combined with
+                  placementGroupStrategy "none".
+                items:
+                  format: int64
+                  minimum: 1
+                  type: integer
+                maxItems: 50
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: set
               placementGroupStrategy:
                 default: spread
+                description: |-
+                  PlacementGroupStrategy controls placement groups for provider-managed
+                  placement. "spread" (the default) places each node pool's servers in spread
+                  placement groups the provider creates and names after the cluster and node
+                  pool. Hetzner admits at most 10 servers into one spread group, so a larger
+                  pool rolls over to additional indexed groups (<name>-1, <name>-2, ...),
+                  filling the least-full group first. The spread guarantee holds only WITHIN a
+                  group: nodes in different groups may share a physical host, so anti-affinity
+                  degrades gradually with pool size rather than all at once. "none" disables
+                  placement groups.
                 enum:
                 - spread
                 - none
@@ -204,6 +231,11 @@ spec:
             - locations
             - networkID
             type: object
+            x-kubernetes-validations:
+            - message: placementGroupIDs cannot be combined with placementGroupStrategy
+                none
+              rule: '!has(self.placementGroupIDs) || !has(self.placementGroupStrategy)
+                || self.placementGroupStrategy != ''none'''
           status:
             properties:
               conditions:
