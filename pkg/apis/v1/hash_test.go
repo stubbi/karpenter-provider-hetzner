@@ -77,3 +77,39 @@ func TestHash_HashedFieldsChangeIt(t *testing.T) {
 		t.Error("changing the Secret reference's key did not change the hash")
 	}
 }
+
+func TestHash_Bootstrap(t *testing.T) {
+	base := hashOf(nil)
+	boot := func(mutate func(*BootstrapConfiguration)) func(*HCloudNodeClassSpec) {
+		return func(s *HCloudNodeClassSpec) {
+			s.Bootstrap = &BootstrapConfiguration{Distribution: "k3s", Server: "https://10.0.0.2:6443",
+				TokenSecretRef: BootstrapTokenSecretReference{Name: "join", Key: "token"}}
+			if mutate != nil {
+				mutate(s.Bootstrap)
+			}
+		}
+	}
+	with := hashOf(boot(nil))
+	if with == base {
+		t.Fatal("adding spec.bootstrap did not change the hash")
+	}
+	for name, mutate := range map[string]func(*BootstrapConfiguration){
+		"distribution": func(b *BootstrapConfiguration) { b.Distribution = "rke2" },
+		"server":       func(b *BootstrapConfiguration) { b.Server = "https://10.0.0.3:6443" },
+		"token ref":    func(b *BootstrapConfiguration) { b.TokenSecretRef.Name = "other" },
+		"version":      func(b *BootstrapConfiguration) { b.Version = "v1.31.5+k3s1" },
+		"extra config": func(b *BootstrapConfiguration) { b.ExtraConfig = "node-ip: 10.0.0.9" },
+	} {
+		if hashOf(boot(mutate)) == with {
+			t.Errorf("bootstrap %s did not change the hash", name)
+		}
+	}
+	// With bootstrap the kubelet block is rendered onto the node, so it is hashed.
+	withKubelet := hashOf(func(s *HCloudNodeClassSpec) {
+		boot(nil)(s)
+		s.Kubelet = &KubeletConfiguration{KubeReserved: map[string]ReservedQuantity{"cpu": "1"}}
+	})
+	if withKubelet == with {
+		t.Error("kubelet did not change the hash of a bootstrapped node class")
+	}
+}

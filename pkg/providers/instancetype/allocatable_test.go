@@ -370,3 +370,23 @@ func TestCRDPattern_VMMemoryOverheadPercent(t *testing.T) {
 		}
 	}
 }
+
+// With a provider-rendered bootstrap the kubelet runs exactly the flags the
+// provider writes (see bootstrap.KubeletArgs), so an empty declaration models the
+// kubelet defaults rendered there, not the legacy 100m/100Mi guess.
+func TestAllocatable_BootstrapModelsRenderedFlags(t *testing.T) {
+	st := makeServerType("cx23", hcloud.ArchitectureX86, hcloud.CPUTypeShared, 2, 4, 40, testPricings)
+	nc := &apiv1.HCloudNodeClass{Spec: apiv1.HCloudNodeClassSpec{
+		Bootstrap: &apiv1.BootstrapConfiguration{Distribution: "k3s", Server: "https://10.0.0.2:6443"},
+	}}
+	it := listOne(t, st, nc)
+	if got := reserved(it, corev1.ResourceCPU); got != 0 {
+		t.Errorf("cpu reserved %dm, want 0: nothing is rendered for kube-reserved", got)
+	}
+	if got := reserved(it, corev1.ResourceMemory); got != 100<<20 {
+		t.Errorf("memory reserved %dMi, want the rendered memory.available<100Mi", got>>20)
+	}
+	if got := reserved(it, corev1.ResourceEphemeralStorage); got != tenPercentOf40Gi {
+		t.Errorf("ephemeral-storage reserved %d, want the rendered nodefs.available<10%%", got)
+	}
+}

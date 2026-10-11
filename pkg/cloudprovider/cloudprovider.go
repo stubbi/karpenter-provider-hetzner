@@ -2,6 +2,7 @@ package cloudprovider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/deadline"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/metrics"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/bootstrap"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/imagefamily"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/instance"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/instancetype"
@@ -50,6 +52,9 @@ type CloudProvider struct {
 	typeProvider     *instancetype.Provider
 	imageProvider    *imagefamily.Provider
 	budgets          deadline.Budgets
+	// namespace is the provider's own namespace, where spec.bootstrap token
+	// Secrets are read from.
+	namespace string
 }
 
 // NewCloudProvider creates a new CloudProvider.
@@ -72,6 +77,13 @@ func NewCloudProvider(
 // Production keeps the defaults; tests shrink them.
 func (cp *CloudProvider) WithBudgets(b deadline.Budgets) *CloudProvider {
 	cp.budgets = b
+	return cp
+}
+
+// WithControllerNamespace sets the namespace spec.bootstrap token Secrets are read
+// from: always the provider's own, never one named by the NodeClass.
+func (cp *CloudProvider) WithControllerNamespace(namespace string) *CloudProvider {
+	cp.namespace = namespace
 	return cp
 }
 
@@ -296,6 +308,12 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	userData, err := cp.resolveUserData(prepCtx, nodeClass)
 	if err != nil {
 		return nil, fmt.Errorf("resolving userData: %w", err)
+	}
+	if nodeClass.Spec.Bootstrap != nil {
+		userData, err = cp.renderBootstrap(prepCtx, nodeClass, userData)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Preparation is done; release its budget before the create, which carries
@@ -630,6 +648,34 @@ func (cp *CloudProvider) resolveUserData(ctx context.Context, nc *apiv1.HCloudNo
 		return "", fmt.Errorf("userData secret %s/%s has no non-empty key %q", ref.Namespace, ref.Name, ref.Key)
 	}
 	return string(data), nil
+}
+
+// renderBootstrap renders the k3s/RKE2 join cloud-config for spec.bootstrap, merging
+// the operator's userData extension into it. Content the NodeClass itself makes
+// unrenderable (a bad extension, a collision with a provider-owned key, a missing
+// token Secret) is a NodeClassNotReadyError, so core deletes the NodeClaim instead of
+// retrying an identical launch; an API error reading the Secret stays retryable.
+func (cp *CloudProvider) renderBootstrap(ctx context.Context, nc *apiv1.HCloudNodeClass, extension string) (string, error) {
+	token, err := bootstrap.ReadToken(ctx, cp.kubeClient, cp.namespace, nc.Spec.Bootstrap.TokenSecretRef)
+	if err != nil {
+		if errors.Is(err, bootstrap.ErrTokenUnavailable) {
+			return "", karpcp.NewNodeClassNotReadyError(fmt.Errorf("HCloudNodeClass %q: %w", nc.Name, err))
+		}
+		return "", err
+	}
+	rendered, err := bootstrap.Render(bootstrap.Input{
+		Bootstrap: *nc.Spec.Bootstrap,
+		Kubelet:   nc.Spec.Kubelet,
+		Token:     token,
+		UserData:  extension,
+	})
+	if err != nil {
+		if bootstrap.IsInvalid(err) {
+			return "", karpcp.NewNodeClassNotReadyError(fmt.Errorf("HCloudNodeClass %q: %w", nc.Name, err))
+		}
+		return "", err
+	}
+	return rendered, nil
 }
 
 // resolveNodeClass fetches the HCloudNodeClass referenced by ref.
