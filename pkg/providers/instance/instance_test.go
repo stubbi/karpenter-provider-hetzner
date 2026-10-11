@@ -399,7 +399,7 @@ func TestCreate_WaitsForActionsAndSetsPublicNet(t *testing.T) {
 func TestErrorCode(t *testing.T) {
 	quota := hcloud.Error{Code: hcloud.ErrorCodeResourceLimitExceeded, Message: "shared core limit exceeded"}
 	for want, err := range map[string]error{
-		"resource_limit_exceeded": fmt.Errorf("creating server: %w", MapCreateError(quota)), // through the ICE wrapper
+		"resource_limit_exceeded": fmt.Errorf("creating server: %w", MapCreateError(quota, "cx22", "nbg1")), // through the CreateError wrapper
 		"uniqueness_error":        fmt.Errorf("server %q: %w", "x", hcloud.Error{Code: hcloud.ErrorCodeUniquenessError}),
 		"other":                   errors.New("boom"),
 	} {
@@ -1071,5 +1071,26 @@ func TestCreate_LookupFailureFailsCreate(t *testing.T) {
 	}
 	if sc.createCalls != 0 {
 		t.Errorf("created a server without knowing whether one exists")
+	}
+}
+
+func TestDelete_ProtectedServerExplainsTheFix(t *testing.T) {
+	client := newMockServerClient()
+	client.servers[7] = ownedServer(7, "node-7")
+	client.deleteErr = hcloud.Error{Code: hcloud.ErrorCodeProtected, Message: "server is delete protected"}
+	p := NewProvider(client, "test-cluster")
+
+	err := p.Delete(context.Background(), FormatProviderID(7))
+	if err == nil || karpcp.IsNodeClaimNotFoundError(err) {
+		t.Fatalf("err = %v, want a plain error that keeps the NodeClaim terminating", err)
+	}
+	if !strings.Contains(err.Error(), "delete protection") || !strings.Contains(err.Error(), "disable-protection") {
+		t.Errorf("error does not say how to clear the protection: %v", err)
+	}
+	if !hcloud.IsError(err, hcloud.ErrorCodeProtected) {
+		t.Error("hcloud cause lost; the delete error metric could not label it")
+	}
+	if got := errorCode(err); got != "protected" {
+		t.Errorf("errorCode = %q, want protected", got)
 	}
 }

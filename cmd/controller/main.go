@@ -42,6 +42,17 @@ func main() {
 		return
 	}
 
+	// Fail fast on a token Hetzner rejects, instead of starting healthy and failing
+	// every create. Transient failures only warn: see ValidateToken.
+	tokenWarning, err := hetznerop.ValidateToken(ctx, &hcloudClient.Server)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Hetzner API token check failed")
+		return
+	}
+	if tokenWarning != nil {
+		log.FromContext(ctx).Error(tokenWarning, "Hetzner API token check inconclusive")
+	}
+
 	// Create the three providers.
 	instanceProvider := instance.NewProviderWithPlacementGroups(&hcloudClient.Server, &hcloudClient.PlacementGroup, cfg.ClusterName, &hcloudClient.Action)
 	typeProvider := instancetype.NewProvider(&hcloudClient.ServerType)

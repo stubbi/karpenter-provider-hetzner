@@ -54,6 +54,15 @@ var (
 		Help:      "Total number of Hetzner server delete calls by result.",
 	}, []string{"result"})
 
+	// serverDeleteErrorsTotal counts failed server deletes by hcloud error code,
+	// so a protected server or a bad token is distinguishable from a transient
+	// API failure. A separate series keeps server_delete_total's labels stable.
+	serverDeleteErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "karpenter_hetzner",
+		Name:      "server_delete_errors_total",
+		Help:      "Total number of failed Hetzner server deletes by hcloud error code.",
+	}, []string{"code"})
+
 	// hcloudAPICallsTotal counts hcloud API calls by operation and result. We
 	// scope it to the operations we actually instrument (server_create,
 	// server_delete, placement_group, image_list) to keep label cardinality
@@ -141,6 +150,7 @@ func init() {
 		serverCreateErrorsTotal,
 		serverCreateDurationSeconds,
 		serverDeleteTotal,
+		serverDeleteErrorsTotal,
 		hcloudAPICallsTotal,
 		driftDetectedTotal,
 		instanceTypeCacheTotal,
@@ -188,6 +198,12 @@ func RecordServerCreate(result string, dur time.Duration) {
 // ("other" when the error carries none).
 func RecordServerCreateError(code string) {
 	serverCreateErrorsTotal.WithLabelValues(code).Inc()
+}
+
+// RecordServerDeleteError records a failed server delete by hcloud error code
+// ("other" when the error carries none).
+func RecordServerDeleteError(code string) {
+	serverDeleteErrorsTotal.WithLabelValues(code).Inc()
 }
 
 // RecordServerDelete records a server delete result.

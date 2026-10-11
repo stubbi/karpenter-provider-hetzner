@@ -317,8 +317,12 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 		EnablePublicIPv6:       nodeClass.Spec.PublicIPv6Enabled(),
 	})
 	if err != nil {
-		if karpcp.IsInsufficientCapacityError(err) {
-			cp.typeProvider.MarkUnavailable(selected.Name, location)
+		// Quarantine only what the error itself names. Quota exhaustion, a bad
+		// token or a full subnet are not about this offering, and marking it
+		// unavailable for them would walk the whole catalogue into the cache one
+		// failed create at a time, for every NodePool in the cluster (#64).
+		if serverType, loc, ok := instance.QuarantineTarget(err); ok {
+			cp.typeProvider.MarkUnavailable(serverType, loc)
 		}
 		return nil, fmt.Errorf("creating server: %w", err)
 	}
