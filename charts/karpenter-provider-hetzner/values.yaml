@@ -29,6 +29,19 @@ hcloud:
   # healthy API.
   apiTimeout: 30s
 
+# orphanGC reclaims Hetzner servers this cluster created for a NodeClaim that no
+# longer exists and that never became a Node -- e.g. a create that hcloud
+# accepted but whose provider ID was never recorded because the controller was
+# restarted mid-boot. Only servers labelled with this cluster's CLUSTER_NAME AND a
+# karpenter.sh/nodeclaim label are ever considered, and only once older than
+# gracePeriod (minimum 15m, which is core's registration timeout). Servers without
+# the nodeclaim label are never touched. Two clusters must never share a
+# clusterName in one Hetzner project: each would treat the other's servers as its
+# own.
+orphanGC:
+  enabled: true
+  gracePeriod: 30m
+
 serviceAccount:
   create: true
   # Empty means the release-scoped generated name. Before 3.0.0 this defaulted to

@@ -132,9 +132,49 @@ func errorCode(err error) string {
 	return "other"
 }
 
+// findForNodeClaim returns the server this cluster already created for a
+// NodeClaim, or nil. Every server carries the karpenter.sh/nodeclaim label, so a
+// create that is retried after hcloud accepted it -- the action wait failed, the
+// context was cancelled by a rolling update or a leader handover, the process
+// died -- finds the first attempt's server here instead of creating a second one
+// and orphaning the first (#61).
+func (p *Provider) findForNodeClaim(ctx context.Context, nodeClaim string) (*hcloud.Server, error) {
+	servers, err := p.client.AllWithOpts(ctx, hcloud.ServerListOpts{
+		ListOpts: hcloud.ListOpts{
+			LabelSelector: fmt.Sprintf("%s=%s,%s=%s,%s=%s",
+				apiv1.ServerLabelManagedBy, apiv1.ServerValueManagedBy,
+				apiv1.ServerLabelCluster, p.clusterName,
+				apiv1.ServerLabelNodeClaim, nodeClaim),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("looking up existing server for nodeclaim %q: %w", nodeClaim, err)
+	}
+	for _, s := range servers {
+		// A server already being deleted cannot be adopted; creating a fresh one
+		// is right, and its name is free again once the delete completes.
+		if s.Status == hcloud.ServerStatusDeleting {
+			continue
+		}
+		return s, nil
+	}
+	return nil, nil
+}
+
 // create is the internal implementation of Create, instrumented by Create().
 func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server, error) {
 	log := logf.FromContext(ctx)
+	if opts.NodeClaim != "" {
+		existing, err := p.findForNodeClaim(ctx, opts.NodeClaim)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			log.Info("adopting server already created for this nodeclaim",
+				"name", opts.Name, "serverID", existing.ID, "nodeClaim", opts.NodeClaim)
+			return existing, nil
+		}
+	}
 	labels := make(map[string]string, len(opts.Labels)+3)
 	for k, v := range opts.Labels {
 		labels[k] = v
@@ -228,6 +268,17 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 				p.forgetPlacementGroups(pgKey)
 			default:
 				p.releasePlacementGroup(pgKey, pgID)
+			}
+		}
+		// A duplicate name means an earlier attempt for this NodeClaim got as far
+		// as hcloud, e.g. its create raced this one. Adopt that server rather than
+		// failing the launch and leaving it behind.
+		if opts.NodeClaim != "" && hcloud.IsError(err, hcloud.ErrorCodeUniquenessError) {
+			existing, lookupErr := p.findForNodeClaim(ctx, opts.NodeClaim)
+			if lookupErr == nil && existing != nil {
+				log.Info("adopting server after a duplicate-name create",
+					"name", opts.Name, "serverID", existing.ID, "nodeClaim", opts.NodeClaim)
+				return existing, nil
 			}
 		}
 		return nil, MapCreateError(err)
