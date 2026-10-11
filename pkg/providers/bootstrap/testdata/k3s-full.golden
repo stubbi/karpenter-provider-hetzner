@@ -1,0 +1,28 @@
+#cloud-config
+packages:
+- jq
+runcmd:
+- curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.31.5+k3s1 sh -s - agent
+- echo joined
+write_files:
+- content: |
+    flannel-iface: enp7s0
+    kubelet-arg:
+    - cloud-provider=external
+    - eviction-hard=imagefs.available<5%,memory.available<400Mi,nodefs.available<10%
+    - kube-reserved=cpu=200m,memory=512Mi
+    - max-pods=200
+    - system-reserved=cpu=200m,memory=512Mi
+    - image-gc-high-threshold=70
+    node-ip: 10.0.1.5
+    node-label:
+    - team=a
+    node-taint:
+    - karpenter.sh/unregistered=:NoExecute
+    server: https://10.0.0.2:6443
+    token: K10agent::token
+  owner: root:root
+  path: /etc/rancher/k3s/config.yaml
+  permissions: "0600"
+- content: hi
+  path: /etc/motd

@@ -64,7 +64,7 @@ func main() {
 		instanceProvider,
 		typeProvider,
 		imageProvider,
-	)
+	).WithControllerNamespace(hetznerop.ControllerNamespace())
 
 	// Wrap with the overlay decorator (required by NewControllers).
 	cloudProvider := overlay.Decorate(baseCloudProvider, op.GetClient(), op.InstanceTypeStore)
@@ -73,7 +73,8 @@ func main() {
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
 
 	// Our NodeClass status controller (network + image validation, Ready).
-	nodeClassController := nodeclass.NewController(op.GetClient(), &hcloudClient.Network, &hcloudClient.Location, &hcloudClient.Firewall, &hcloudClient.SSHKey, imageProvider)
+	nodeClassController := nodeclass.NewController(op.GetClient(), &hcloudClient.Network, &hcloudClient.Location, &hcloudClient.Firewall, &hcloudClient.SSHKey, imageProvider).
+		WithControllerNamespace(hetznerop.ControllerNamespace())
 
 	providerControllers := []controller.Controller{
 		nodeClassController,

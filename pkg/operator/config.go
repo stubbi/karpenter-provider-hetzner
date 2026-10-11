@@ -54,6 +54,22 @@ type Config struct {
 	OrphanGCGracePeriod time.Duration
 }
 
+// serviceAccountNamespaceFile is where Kubernetes mounts the pod's namespace.
+const serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// ControllerNamespace returns the namespace the provider runs in: POD_NAMESPACE
+// when set (the chart sets it from the downward API), else the service account
+// mount. Empty when neither is available, e.g. outside a cluster.
+func ControllerNamespace() string {
+	if ns := strings.TrimSpace(os.Getenv("POD_NAMESPACE")); ns != "" {
+		return ns
+	}
+	if b, err := os.ReadFile(serviceAccountNamespaceFile); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
+}
+
 // LoadConfig reads provider configuration from the environment.
 // CLUSTER_NAME is required; HCLOUD_API_TIMEOUT is optional.
 func LoadConfig() (*Config, error) {

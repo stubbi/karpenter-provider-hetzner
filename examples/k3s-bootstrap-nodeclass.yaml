@@ -1,0 +1,94 @@
+# k3s agents with a provider-rendered bootstrap (spec.bootstrap).
+#
+# The provider writes /etc/rancher/k3s/config.yaml (server, token, the
+# karpenter.sh/unregistered startup taint, kubelet flags matching the advertised
+# allocatable) and installs the agent. No hand-written join cloud-init needed.
+# See docs/provider-bootstrap.md.
+#
+# Prerequisites:
+#   - A k3s server reachable from new nodes on :6443, started with
+#     --disable-cloud-controller and an --agent-token.
+#   - hcloud-cloud-controller-manager installed (it sets providerID hcloud://<id>).
+#   - The agent token in a Secret in the namespace the provider runs in:
+#       kubectl -n karpenter create secret generic k3s-agent-token \
+#         --from-literal=token='<AGENT_TOKEN>'
+#     Use the agent token, not the server token: userData is readable from the
+#     Hetzner metadata service on every node.
+
+apiVersion: karpenter.hetzner.cloud/v1
+kind: HCloudNodeClass
+metadata:
+  name: k3s-bootstrap
+spec:
+  locations:
+    - nbg1
+    - fsn1
+  imageSelector:
+    family: ubuntu
+    version: "24.04"
+  # ADJUST: your Hetzner private network ID.
+  networkID: 123456
+  placementGroupStrategy: spread
+  enablePublicIPv4: true
+  enablePublicIPv6: false
+
+  bootstrap:
+    distribution: k3s
+    # ADJUST: the k3s server's private address.
+    server: https://10.0.0.2:6443
+    tokenSecretRef:
+      name: k3s-agent-token
+      key: token
+    # ADJUST: match your servers' k3s version.
+    version: v1.31.5+k3s1
+    extraConfig: |
+      flannel-iface: enp7s0
+
+  # Rendered into the kubelet flags AND subtracted from allocatable, so the
+  # scheduler's view and the node agree.
+  kubelet:
+    systemReserved:
+      cpu: 100m
+      memory: 256Mi
+    kubeReserved:
+      cpu: 100m
+      memory: 256Mi
+    evictionHard:
+      memory.available: 200Mi
+      nodefs.available: 10%
+
+  # Optional extension, merged into the rendered cloud-config (provider entries
+  # first). Must be a #cloud-config.
+  userData: |
+    #cloud-config
+    packages:
+      - open-iscsi
+
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: k3s-bootstrap-amd64
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.hetzner.cloud
+        kind: HCloudNodeClass
+        name: k3s-bootstrap
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: karpenter.hetzner.cloud/server-family
+          operator: In
+          values: [cpx]
+  limits:
+    cpu: "100"
+    memory: 400Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s

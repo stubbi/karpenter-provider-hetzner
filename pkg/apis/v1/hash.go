@@ -41,10 +41,16 @@ const (
 //     Secret's value is not a deliberate change to the node class, and hashing
 //     it would roll every node whenever a token is rotated. Changing the
 //     reference is the explicit gesture.
-//   - kubelet and vmMemoryOverheadPercent: both describe the node to the
-//     scheduler without changing what is booted (the provider does not render
-//     the kubelet config), so a change re-models capacity for new nodes rather
-//     than requiring the old ones to be replaced.
+//   - kubelet and vmMemoryOverheadPercent, unless spec.bootstrap is set: both
+//     describe the node to the scheduler without changing what is booted, so a
+//     change re-models capacity for new nodes rather than requiring the old ones
+//     to be replaced. With spec.bootstrap the provider renders kubelet into the
+//     node's flags, so it is hashed together with the bootstrap block.
+//   - the join token Secret's contents: as with userData, only the reference is
+//     hashed, so rotating a token never rolls the fleet.
+//
+// Bootstrap and Kubelet are omitted from the encoding when unset, so node
+// classes without spec.bootstrap hash exactly as before it existed.
 //
 // Field order and JSON encoding are part of the hash: changing either needs a
 // NodeClassHashVersion bump.
@@ -57,6 +63,8 @@ type nodeClassHashInput struct {
 	PlacementGroupStrategy string                   `json:"placementGroupStrategy"`
 	EnablePublicIPv4       bool                     `json:"enablePublicIPv4"`
 	EnablePublicIPv6       bool                     `json:"enablePublicIPv6"`
+	Bootstrap              *BootstrapConfiguration  `json:"bootstrap,omitempty"`
+	Kubelet                *KubeletConfiguration    `json:"kubelet,omitempty"`
 }
 
 // Hash returns the hash of the node class fields that drift cannot observe on a
@@ -70,6 +78,10 @@ func (in *HCloudNodeClass) Hash() string {
 	if pg == "" {
 		pg = "spread"
 	}
+	var kubelet *KubeletConfiguration
+	if in.Spec.Bootstrap != nil {
+		kubelet = in.Spec.Kubelet
+	}
 	b, err := json.Marshal(nodeClassHashInput{
 		UserData:               in.Spec.UserData,
 		UserDataSecretRef:      in.Spec.UserDataSecretRef,
@@ -77,6 +89,8 @@ func (in *HCloudNodeClass) Hash() string {
 		PlacementGroupStrategy: pg,
 		EnablePublicIPv4:       in.Spec.PublicIPv4Enabled(),
 		EnablePublicIPv6:       in.Spec.PublicIPv6Enabled(),
+		Bootstrap:              in.Spec.Bootstrap,
+		Kubelet:                kubelet,
 	})
 	if err != nil {
 		// Unreachable: every field is a plain string, int, bool or struct of them.

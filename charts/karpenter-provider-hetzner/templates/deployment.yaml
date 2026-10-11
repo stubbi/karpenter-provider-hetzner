@@ -64,6 +64,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.secretRef.name }}
                   key: {{ .Values.auth.secretRef.key }}
+            # spec.bootstrap token Secrets are read from this namespace only.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: CLUSTER_NAME
               value: {{ .Values.clusterName | quote }}
             - name: HCLOUD_API_TIMEOUT

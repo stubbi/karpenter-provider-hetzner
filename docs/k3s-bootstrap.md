@@ -3,6 +3,12 @@
 A concise guide to joining [k3s](https://k3s.io) agent (worker) nodes with
 karpenter-provider-hetzner.
 
+> **Prefer `spec.bootstrap`.** The provider can now render the join
+> configuration for k3s and RKE2 itself, including the registration taint and
+> kubelet flags matching the advertised allocatable. See
+> [provider-rendered bootstrap](provider-bootstrap.md). This recipe remains for
+> clusters that need full control of the cloud-init.
+
 See [`examples/k3s-nodeclass.yaml`](../examples/k3s-nodeclass.yaml) for an
 apply-ready NodeClass and NodePool with a full cloud-init template.
 
