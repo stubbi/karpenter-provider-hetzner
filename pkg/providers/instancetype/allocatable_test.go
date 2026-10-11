@@ -245,3 +245,128 @@ func TestAllocatable_PerNodeClassOnSharedCatalogue(t *testing.T) {
 		}
 	}
 }
+
+// maxPods replaces the advertised pod capacity, and on its own says nothing
+// about reservations, so the legacy flat reservation still applies.
+func TestCapacity_MaxPods(t *testing.T) {
+	st := makeServerType("cx23", hcloud.ArchitectureX86, hcloud.CPUTypeShared, 2, 4, 40, testPricings)
+	pods := func(nc *apiv1.HCloudNodeClass) int64 {
+		q := listOne(t, st, nc).Capacity[corev1.ResourcePods]
+		return q.Value()
+	}
+	if got := pods(&apiv1.HCloudNodeClass{}); got != 110 {
+		t.Errorf("default pod capacity %d, want 110", got)
+	}
+	maxPods := int32(250)
+	nc := kubeletNodeClass(&apiv1.KubeletConfiguration{MaxPods: &maxPods})
+	if got := pods(nc); got != 250 {
+		t.Errorf("pod capacity %d, want the declared 250", got)
+	}
+	it := listOne(t, st, nc)
+	if got := reserved(it, corev1.ResourceMemory); got != 100<<20 {
+		t.Errorf("memory reserved %dMi, want the legacy 100Mi: maxPods alone declares no reservations", got>>20)
+	}
+	if got := it.Allocatable()[corev1.ResourcePods]; got.Value() != 250 {
+		t.Errorf("allocatable pods %d, want 250", got.Value())
+	}
+}
+
+// The advertised memory is more than the guest kernel reports. The registered
+// capacities below are the same real nodes as
+// TestAllocatable_ReservationMatchesRegisteredNode. With the documented 7% the
+// model must never claim more memory than the node registers (which strands
+// pods), and should stay close enough to be worth declaring.
+func TestCapacity_VMMemoryOverheadMatchesRegisteredNodes(t *testing.T) {
+	nc := &apiv1.HCloudNodeClass{Spec: apiv1.HCloudNodeClassSpec{VMMemoryOverheadPercent: "7"}}
+	for _, tc := range []struct {
+		name           string
+		memGB          float32
+		realCapacityKi int64
+	}{
+		{"cpx22", 4, 3905948},
+		{"cx33", 8, 7937224},
+		{"cx43", 16, 15988560},
+		{"cx53", 32, 32089152},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			it := listOne(t, makeServerType(tc.name, hcloud.ArchitectureX86, hcloud.CPUTypeShared, 2, tc.memGB, 80, testPricings), nc)
+			got := it.Capacity[corev1.ResourceMemory]
+			registered := tc.realCapacityKi * 1024
+			if got.Value() > registered {
+				t.Errorf("modelled %dMi exceeds the %dMi the node registers", got.Value()>>20, registered>>20)
+			}
+			if got.Value() < registered*95/100 {
+				t.Errorf("modelled %dMi undersells the registered %dMi by more than 5%%", got.Value()>>20, registered>>20)
+			}
+			if got.Value()%(1<<20) != 0 {
+				t.Errorf("modelled memory %d is not a whole MiB", got.Value())
+			}
+		})
+	}
+}
+
+// Without the knob capacity is the advertised size, and declaring it for one
+// node class never leaks into another's view of the shared catalogue.
+func TestCapacity_VMMemoryOverheadPerNodeClass(t *testing.T) {
+	p := NewProvider(&mockServerTypeClient{types: []*hcloud.ServerType{
+		makeServerType("cx23", hcloud.ArchitectureX86, hcloud.CPUTypeShared, 2, 4, 40, testPricings),
+	}})
+	adjusted := &apiv1.HCloudNodeClass{Spec: apiv1.HCloudNodeClassSpec{VMMemoryOverheadPercent: "10"}}
+	for i, tc := range []struct {
+		nc   *apiv1.HCloudNodeClass
+		want int64
+	}{
+		{adjusted, (4 << 30) * 9 / 10 / (1 << 20) * (1 << 20)},
+		{&apiv1.HCloudNodeClass{}, 4 << 30},
+		{nil, 4 << 30},
+		{adjusted, (4 << 30) * 9 / 10 / (1 << 20) * (1 << 20)},
+	} {
+		types, err := p.List(context.Background(), tc.nc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := types[0].Capacity[corev1.ResourceMemory]; got.Value() != tc.want {
+			t.Errorf("call %d: memory capacity %d, want %d", i, got.Value(), tc.want)
+		}
+	}
+}
+
+// Percentage eviction thresholds are taken of the capacity the node registers
+// with, so they shrink with the VM overhead too.
+func TestCapacity_EvictionPercentUsesAdjustedCapacity(t *testing.T) {
+	nc := &apiv1.HCloudNodeClass{Spec: apiv1.HCloudNodeClassSpec{
+		VMMemoryOverheadPercent: "10",
+		Kubelet: &apiv1.KubeletConfiguration{EvictionHard: map[string]apiv1.EvictionThreshold{
+			"memory.available": "10%", "nodefs.available": "0%",
+		}},
+	}}
+	it := listOne(t, makeServerType("cx23", hcloud.ArchitectureX86, hcloud.CPUTypeShared, 2, 4, 40, testPricings), nc)
+	capacity := it.Capacity[corev1.ResourceMemory]
+	want, _ := resolveThreshold("10%", capacity)
+	if got := reserved(it, corev1.ResourceMemory); got != want.Value() {
+		t.Errorf("memory reserved %d, want 10%% of the adjusted capacity (%d)", got, want.Value())
+	}
+}
+
+func TestCRDPattern_VMMemoryOverheadPercent(t *testing.T) {
+	raw, err := os.ReadFile("../../../charts/karpenter-provider-hetzner/crds/karpenter.hetzner.cloud_hcloudnodeclasses.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(raw, &crd); err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["vmMemoryOverheadPercent"].Pattern)
+	for v, want := range map[string]bool{
+		"7": true, "0": true, "6.5": true, "49.99": true, "10": true, "0.25": true,
+		"50": false, "100": false, "-1": false, "7%": false, "": false, "6.555": false, " 7": false, "7.": false, "1e1": false,
+	} {
+		if got := re.MatchString(v); got != want {
+			t.Errorf("%q: admitted=%v, want %v", v, got, want)
+		}
+		if want && v != "0" && vmMemoryOverheadFraction(v) == 0 {
+			t.Errorf("%q is admitted but parses to no overhead", v)
+		}
+	}
+}

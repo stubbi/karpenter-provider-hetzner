@@ -136,6 +136,16 @@ spec:
                     - message: valid keys for kubeReserved are ['cpu','memory','ephemeral-storage','pid']
                       rule: self.all(x, x=='cpu' || x=='memory' || x=='ephemeral-storage'
                         || x=='pid')
+                  maxPods:
+                    description: |-
+                      MaxPods is the kubelet's maxPods setting: how many pods the node admits,
+                      which Karpenter advertises as the node's pod capacity. Talos and k3s users
+                      commonly change it. When omitted, the kubelet default of 110 is assumed.
+                      Declaring it does not change how reservations are interpreted.
+                    format: int32
+                    maximum: 1024
+                    minimum: 1
+                    type: integer
                   systemReserved:
                     additionalProperties:
                       description: ReservedQuantity is a non-negative resource quantity,
@@ -226,6 +236,22 @@ spec:
                 - name
                 - namespace
                 type: object
+              vmMemoryOverheadPercent:
+                description: |-
+                  VMMemoryOverheadPercent is the share of a server type's advertised memory
+                  that the guest operating system never sees, as a decimal percentage such as
+                  "7" or "6.5". Hetzner advertises the memory assigned to the VM; the kernel
+                  reports less (firmware, kernel image, page tables, crash kernel), so a node's
+                  registered capacity is smaller than the advertised size. Measured on
+                  registered nodes the gap is about 6.9% on a 4 GB type, 5.4% on 8 GB, 4.7% on
+                  16 GB and 4.4% on 32 GB: a fixed part plus a proportional part, so choose
+                  the value that fits the smallest type the node class can launch (a larger
+                  value only undersells the larger types).
+
+                  When omitted, capacity is the advertised memory, as in earlier releases.
+                maxLength: 5
+                pattern: ^([0-9]|[1-4][0-9])([.][0-9]{1,2})?$
+                type: string
             required:
             - imageSelector
             - locations

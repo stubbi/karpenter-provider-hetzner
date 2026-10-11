@@ -107,11 +107,27 @@ type HCloudNodeClassSpec struct {
 	// When omitted, a flat 100m CPU / 100Mi memory kubeReserved is assumed.
 	// +optional
 	Kubelet *KubeletConfiguration `json:"kubelet,omitempty"`
+
+	// VMMemoryOverheadPercent is the share of a server type's advertised memory
+	// that the guest operating system never sees, as a decimal percentage such as
+	// "7" or "6.5". Hetzner advertises the memory assigned to the VM; the kernel
+	// reports less (firmware, kernel image, page tables, crash kernel), so a node's
+	// registered capacity is smaller than the advertised size. Measured on
+	// registered nodes the gap is about 6.9% on a 4 GB type, 5.4% on 8 GB, 4.7% on
+	// 16 GB and 4.4% on 32 GB: a fixed part plus a proportional part, so choose
+	// the value that fits the smallest type the node class can launch (a larger
+	// value only undersells the larger types).
+	//
+	// When omitted, capacity is the advertised memory, as in earlier releases.
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-4][0-9])([.][0-9]{1,2})?$`
+	// +kubebuilder:validation:MaxLength=5
+	// +optional
+	VMMemoryOverheadPercent string `json:"vmMemoryOverheadPercent,omitempty"`
 }
 
 // KubeletConfiguration mirrors the subset of kubelet settings that change how
-// much of a node is schedulable. Only the reservation knobs are modelled;
-// anything that does not move allocatable is deliberately absent.
+// much of a node is schedulable: the reservations and the pod limit. Anything
+// that does not move allocatable is deliberately absent.
 type KubeletConfiguration struct {
 	// SystemReserved is resources reserved for OS system daemons, matching the
 	// kubelet's --system-reserved.
@@ -138,6 +154,15 @@ type KubeletConfiguration struct {
 	// +kubebuilder:validation:XValidation:message="valid keys for evictionHard are ['memory.available','allocatableMemory.available','nodefs.available','nodefs.inodesFree','imagefs.available','imagefs.inodesFree','containerfs.available','containerfs.inodesFree','pid.available']",rule="self.all(x, x in ['memory.available','allocatableMemory.available','nodefs.available','nodefs.inodesFree','imagefs.available','imagefs.inodesFree','containerfs.available','containerfs.inodesFree','pid.available'])"
 	// +optional
 	EvictionHard map[string]EvictionThreshold `json:"evictionHard,omitempty"`
+
+	// MaxPods is the kubelet's maxPods setting: how many pods the node admits,
+	// which Karpenter advertises as the node's pod capacity. Talos and k3s users
+	// commonly change it. When omitted, the kubelet default of 110 is assumed.
+	// Declaring it does not change how reservations are interpreted.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1024
+	// +optional
+	MaxPods *int32 `json:"maxPods,omitempty"`
 }
 
 // ReservedQuantity is a non-negative resource quantity, such as "512Mi" or "200m".
