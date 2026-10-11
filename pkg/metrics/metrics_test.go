@@ -134,3 +134,12 @@ func TestHistogramRegistered(t *testing.T) {
 		t.Error("histogram karpenter_hetzner_server_create_duration_seconds not found in registry")
 	}
 }
+
+func TestRecordServerDeleteError_CountsByCode(t *testing.T) {
+	before := counterValue(t, "karpenter_hetzner_server_delete_errors_total", "code", "protected")
+	metrics.RecordServerDeleteError("protected")
+	after := counterValue(t, "karpenter_hetzner_server_delete_errors_total", "code", "protected")
+	if after != before+1 {
+		t.Errorf("server_delete_errors_total{code=protected}: before=%v after=%v, want +1", before, after)
+	}
+}

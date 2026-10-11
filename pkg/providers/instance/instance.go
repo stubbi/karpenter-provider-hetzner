@@ -299,7 +299,7 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 				return existing, nil
 			}
 		}
-		return nil, MapCreateError(err)
+		return nil, MapCreateError(err, opts.ServerType, opts.Location)
 	}
 	cancelSubmit()
 
@@ -346,6 +346,7 @@ func (p *Provider) Delete(ctx context.Context, providerID string) error {
 	result := metrics.ResultSuccess
 	if err != nil && !karpcp.IsNodeClaimNotFoundError(err) {
 		result = metrics.ResultError
+		metrics.RecordServerDeleteError(errorCode(err))
 	}
 	metrics.RecordServerDelete(result)
 	return err
@@ -390,6 +391,14 @@ func (p *Provider) delete(ctx context.Context, providerID string) error {
 	if err != nil {
 		if hcloud.IsError(err, hcloud.ErrorCodeNotFound) {
 			return karpcp.NewNodeClaimNotFoundError(fmt.Errorf("server %d not found", id))
+		}
+		if hcloud.IsError(err, hcloud.ErrorCodeProtected) {
+			// Delete protection was enabled out of band. Retrying cannot clear it,
+			// so say exactly what to do: the NodeClaim stays terminating (and its
+			// finalizer in place) until someone removes the protection.
+			return fmt.Errorf("deleting server %d (%s): delete protection is enabled on the server; "+
+				"disable it in the Hetzner console or with `hcloud server disable-protection %d delete` "+
+				"so the NodeClaim can finalize: %w", id, server.Name, id, err)
 		}
 		return fmt.Errorf("deleting server %d: %w", id, err)
 	}
