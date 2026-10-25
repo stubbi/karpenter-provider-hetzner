@@ -8,7 +8,7 @@ This project is pre-1.0 and under active development. Security fixes are applied
 
 **Do not open a public issue for security vulnerabilities.**
 
-Please report privately using GitHub's [private vulnerability reporting](https://github.com/paperclipinc/karpenter-provider-hetzner/security/advisories/new) ("Report a vulnerability" on the Security tab). If that is unavailable, email **security@paperclip.inc** with:
+Please report privately using GitHub's [private vulnerability reporting](https://github.com/stubbi/karpenter-provider-hetzner/security/advisories/new) ("Report a vulnerability" on the Security tab). Please include:
 
 - a description of the issue and its impact,
 - steps to reproduce or a proof of concept,
