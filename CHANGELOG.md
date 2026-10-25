@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Project quota exhaustion (`resource_limit_exceeded`) no longer quarantines offerings. It used to be treated as a capacity error: every failed create blacklisted the cheapest offering for every NodePool, and the next attempt moved on to the next one, until the whole catalogue was blacked out and events blamed capacity. Quota now shows on the NodeClaim's `Launched` condition with reason `ProjectQuotaExceeded`. Offerings are quarantined only when the error names a server type that cannot be created in a location (#64).
 - Create errors that retrying cannot fix are no longer retried as if they were transient. `unauthorized`, `forbidden`, `token_readonly`, `private_net_only_server` and `no_subnet_available` show on `Launched` with a typed reason. `invalid_server_type` quarantines that server type. `uniqueness_error` and `placement_error` are still retried. A delete blocked by delete protection now says how to clear it (#65).
 
+### Changed
+- **Drift now compares against the NodeClass's desired state (#63). This is a behaviour change: NodeClass edits that previously only affected new nodes now replace existing ones.**
+  - Image drift compares the NodeClaim's launch image with the image the NodeClass currently resolves for its architecture. The previous check compared a server's image with itself and could never fire. It applies only when `imageSelector.version` or `imageSelector.selector` pins the image; a bare selector never drifts on image, so a snapshot upload cannot roll the fleet.
+  - New `NodeClassDrift` reason: `userData`, `userDataSecretRef` (the reference, not the Secret's value), `sshKeyIDs`, `placementGroupStrategy` and `enablePublicIPv4`/`enablePublicIPv6` are hashed and recorded on each NodeClaim (`karpenter.hetzner.cloud/nodeclass-hash`). Editing any of them replaces the nodes launched from the previous value.
+  - Upgrading does not replace nodes. NodeClaims launched before this release carry no hash and are not treated as drifted; the provider records the current hash on them, so **the first edit to one of those fields after upgrading rolls the nodes**. Plan NodeClass changes accordingly, and use NodePool disruption budgets to pace the replacement.
+
 ## [3.0.1] - 2026-10-03
 
 ### Fixed

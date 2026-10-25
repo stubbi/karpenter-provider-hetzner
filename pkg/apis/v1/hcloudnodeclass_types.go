@@ -191,12 +191,18 @@ type ImageSelector struct {
 	// +kubebuilder:validation:Enum=talos;ubuntu
 	Family string `json:"family"`
 
+	// Version is matched against the image description. Setting it (or Selector)
+	// pins the image: nodes drift, and are replaced, when the pinned selector
+	// resolves to a different image than the one they were launched from. A selector
+	// with neither set resolves to the newest matching image and never causes image
+	// drift, so a snapshot upload cannot roll the fleet.
 	// +optional
 	Version string `json:"version,omitempty"`
 
 	// Selector is an hcloud label selector applied when listing images, e.g.
 	// {"caph-image-name": "talos-v1.13.3-gvisor"}. Use it to pin the exact image
-	// (version plus baked extensions) instead of fuzzy description matching.
+	// (version plus baked extensions) instead of fuzzy description matching. Like
+	// Version, setting it enables image drift.
 	// +optional
 	Selector map[string]string `json:"selector,omitempty"`
 }
