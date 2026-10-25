@@ -197,6 +197,17 @@ comments explaining every field.
 | `CLUSTER_NAME` | yes | Cluster identifier; scopes managed servers |
 | `METRICS_PORT` | no (8080) | Prometheus metrics port |
 | `HEALTH_PROBE_PORT` | no (8081) | Health/readiness probe port |
+| `ORPHAN_GC_ENABLED` | no (`true`) | Reclaim orphaned servers (chart: `orphanGC.enabled`); see below |
+| `ORPHAN_GC_GRACE_PERIOD` | no (`30m`, min `15m`) | Minimum server age before it can be reclaimed (chart: `orphanGC.gracePeriod`) |
+
+### Orphaned servers
+
+A server can outlive its NodeClaim without ever being recorded on it: hcloud accepts the create, then the controller restarts (rolling update, leader handover, OOM) while the server boots, so no provider ID is written and core never deletes it. Two mechanisms close this:
+
+- **Adoption.** Every server carries a `karpenter.sh/nodeclaim` label. Before creating, the provider looks for this cluster's server with that label and adopts it, and it does the same when hcloud rejects a create as a duplicate name. A retried create therefore never makes a second server.
+- **Orphan reclaim.** Every 5 minutes the controller lists this cluster's managed servers and deletes a server only if it carries a `karpenter.sh/nodeclaim` label, is older than `ORPHAN_GC_GRACE_PERIOD`, its NodeClaim no longer exists, and no Node references its provider ID. Servers without the label are never touched. Reclaims are counted in `karpenter_hetzner_orphaned_servers_reclaimed_total`.
+
+Both rely on `CLUSTER_NAME`: two clusters must never share one in a Hetzner project.
 
 ### API budget
 

@@ -38,6 +38,10 @@ type mockServerClient struct {
 	deleteErr        error
 	lastOpts         hcloud.ServerCreateOpts
 	createCalls      int
+	listCalls        int
+	listErr          error
+	// uniqueNames makes Create refuse a name already in use, as hcloud does.
+	uniqueNames bool
 	// pgs, when set, makes Create enforce spread-group capacity the way hcloud
 	// does: a create into a full group fails with placement_error.
 	pgs *mockPlacementGroupClient
@@ -57,6 +61,13 @@ func (m *mockServerClient) Create(_ context.Context, opts hcloud.ServerCreateOpt
 	m.createCalls++
 	if m.createErr != nil {
 		return hcloud.ServerCreateResult{}, nil, m.createErr
+	}
+	if m.uniqueNames {
+		for _, s := range m.servers {
+			if s.Name == opts.Name {
+				return hcloud.ServerCreateResult{}, nil, hcloud.Error{Code: hcloud.ErrorCodeUniquenessError, Message: "server name is already used"}
+			}
+		}
 	}
 	id := m.nextID
 	if m.pgs != nil && opts.PlacementGroup != nil {
@@ -88,10 +99,18 @@ func (m *mockServerClient) GetByID(_ context.Context, id int64) (*hcloud.Server,
 }
 
 func (m *mockServerClient) AllWithOpts(_ context.Context, opts hcloud.ServerListOpts) ([]*hcloud.Server, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.lastListSelector = opts.LabelSelector
+	m.listCalls++
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	result := make([]*hcloud.Server, 0, len(m.servers))
 	for _, s := range m.servers {
-		result = append(result, s)
+		if matchesSelector(s.Labels, opts.LabelSelector) {
+			result = append(result, s)
+		}
 	}
 	return result, nil
 }
@@ -257,8 +276,9 @@ func TestGet_NotFound(t *testing.T) {
 
 func TestList(t *testing.T) {
 	client := newMockServerClient()
-	client.servers[1] = &hcloud.Server{ID: 1, Name: "node-1"}
-	client.servers[2] = &hcloud.Server{ID: 2, Name: "node-2"}
+	client.servers[1] = ownedServer(1, "node-1")
+	client.servers[2] = ownedServer(2, "node-2")
+	client.servers[3] = &hcloud.Server{ID: 3, Name: "not-ours"}
 	p := NewProvider(client, "test-cluster")
 
 	servers, err := p.List(context.Background())
@@ -934,5 +954,122 @@ func TestCreate_ExplicitPlacementGroupIDs_WithStrategyNone(t *testing.T) {
 	}
 	if sc.lastOpts.PlacementGroup == nil || sc.lastOpts.PlacementGroup.ID != 41 {
 		t.Errorf("explicit group not applied: %v", sc.lastOpts.PlacementGroup)
+	}
+}
+
+func nodeClaimOpts(name string) CreateOpts {
+	return CreateOpts{Name: name, NodeClaim: name, ServerType: "cx22", Location: "nbg1", Image: &hcloud.Image{ID: 1}}
+}
+
+// TestCreate_RetryAfterFailedWaitAdoptsServer is the #61 leak: hcloud accepted
+// the create, the action wait then failed (or the context was cancelled), so no
+// provider ID was recorded. The retry must adopt that server, not create a
+// second one and orphan the first.
+func TestCreate_RetryAfterFailedWaitAdoptsServer(t *testing.T) {
+	sc := newMockServerClient()
+	sc.action = &hcloud.Action{ID: 1}
+	waiter := &mockActionWaiter{err: context.Canceled}
+	p := NewProviderWithWaiter(sc, "test-cluster", waiter)
+
+	if _, err := p.Create(context.Background(), nodeClaimOpts("nc-1")); err == nil {
+		t.Fatal("expected the failed wait to fail the first attempt")
+	}
+	waiter.err = nil
+	server, err := p.Create(context.Background(), nodeClaimOpts("nc-1"))
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if sc.createCalls != 1 {
+		t.Errorf("hcloud create called %d times, want 1: the retry created a duplicate", sc.createCalls)
+	}
+	if len(sc.servers) != 1 || server.ID != 100 {
+		t.Errorf("retry returned server %d with %d servers in the project, want the original server 100 alone", server.ID, len(sc.servers))
+	}
+}
+
+// racingServerClient hides existing servers from the first list call, the way a
+// concurrent create for the same NodeClaim that lands just after the pre-create
+// lookup does.
+type racingServerClient struct {
+	*mockServerClient
+	lists int
+}
+
+func (r *racingServerClient) AllWithOpts(ctx context.Context, opts hcloud.ServerListOpts) ([]*hcloud.Server, error) {
+	r.lists++
+	if r.lists == 1 {
+		return nil, nil
+	}
+	return r.mockServerClient.AllWithOpts(ctx, opts)
+}
+
+// TestCreate_AdoptsOnUniquenessError covers a duplicate-name create the
+// pre-create lookup could not see: the create fails with uniqueness_error and
+// the provider adopts the server that won, instead of failing the launch.
+func TestCreate_AdoptsOnUniquenessError(t *testing.T) {
+	sc := newMockServerClient()
+	sc.uniqueNames = true
+	existing := ownedServer(7, "nc-2")
+	existing.Labels[apiv1.ServerLabelNodeClaim] = "nc-2"
+	sc.servers[7] = existing
+	p := NewProvider(&racingServerClient{mockServerClient: sc}, "test-cluster")
+
+	got, err := p.Create(context.Background(), nodeClaimOpts("nc-2"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got.ID != 7 || len(sc.servers) != 1 {
+		t.Errorf("got server %d with %d servers, want server 7 adopted", got.ID, len(sc.servers))
+	}
+}
+
+// TestCreate_PreCreateLookupAdopts checks the common retry path makes no create
+// call at all when the NodeClaim's server already exists.
+func TestCreate_PreCreateLookupAdopts(t *testing.T) {
+	sc := newMockServerClient()
+	existing := ownedServer(9, "nc-3")
+	existing.Labels[apiv1.ServerLabelNodeClaim] = "nc-3"
+	sc.servers[9] = existing
+	p := NewProvider(sc, "test-cluster")
+
+	got, err := p.Create(context.Background(), nodeClaimOpts("nc-3"))
+	if err != nil || got.ID != 9 || sc.createCalls != 0 {
+		t.Fatalf("got %v, err %v, creates %d; want server 9 adopted without a create", got, err, sc.createCalls)
+	}
+}
+
+// TestCreate_DoesNotAdoptOtherClustersOrDeletingServers checks adoption is scoped
+// to this cluster's labelled servers and skips one already being deleted.
+func TestCreate_DoesNotAdoptOtherClustersOrDeletingServers(t *testing.T) {
+	sc := newMockServerClient()
+	other := ownedServer(11, "nc-4")
+	other.Labels[apiv1.ServerLabelCluster] = "other-cluster"
+	other.Labels[apiv1.ServerLabelNodeClaim] = "nc-4"
+	deleting := ownedServer(12, "nc-4")
+	deleting.Labels[apiv1.ServerLabelNodeClaim] = "nc-4"
+	deleting.Status = hcloud.ServerStatusDeleting
+	sc.servers[11], sc.servers[12] = other, deleting
+	p := NewProvider(sc, "test-cluster")
+
+	got, err := p.Create(context.Background(), nodeClaimOpts("nc-4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID == 11 || got.ID == 12 || sc.createCalls != 1 {
+		t.Errorf("adopted server %d (creates %d); want a fresh server", got.ID, sc.createCalls)
+	}
+}
+
+// TestCreate_LookupFailureFailsCreate makes sure an unreadable server list does
+// not fall through to a blind create, which could duplicate a server.
+func TestCreate_LookupFailureFailsCreate(t *testing.T) {
+	sc := newMockServerClient()
+	sc.listErr = errors.New("rate limited")
+	p := NewProvider(sc, "test-cluster")
+	if _, err := p.Create(context.Background(), nodeClaimOpts("nc-5")); err == nil {
+		t.Fatal("expected the lookup failure to fail the create")
+	}
+	if sc.createCalls != 0 {
+		t.Errorf("created a server without knowing whether one exists")
 	}
 }
