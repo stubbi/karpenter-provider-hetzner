@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/deadline"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/metrics"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/imagefamily"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/instance"
@@ -44,6 +45,7 @@ type CloudProvider struct {
 	instanceProvider *instance.Provider
 	typeProvider     *instancetype.Provider
 	imageProvider    *imagefamily.Provider
+	budgets          deadline.Budgets
 }
 
 // NewCloudProvider creates a new CloudProvider.
@@ -58,7 +60,15 @@ func NewCloudProvider(
 		instanceProvider: instanceProvider,
 		typeProvider:     typeProvider,
 		imageProvider:    imageProvider,
+		budgets:          deadline.Defaults(),
 	}
+}
+
+// WithBudgets replaces the per-class context budgets (see package deadline).
+// Production keeps the defaults; tests shrink them.
+func (cp *CloudProvider) WithBudgets(b deadline.Budgets) *CloudProvider {
+	cp.budgets = b
+	return cp
 }
 
 // Name returns the cloud provider name.
@@ -153,7 +163,14 @@ func hasResolvedImage(nodeClass *apiv1.HCloudNodeClass, arch hcloud.Architecture
 // Create provisions a new Hetzner server for the given NodeClaim.
 func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
 	log := logf.FromContext(ctx)
-	nodeClass, err := cp.resolveNodeClass(ctx, nodeClaim.Spec.NodeClassRef)
+	// Preparation (node class, catalogue, image, userData) runs under the
+	// submission budget. The server create itself is handed ctx, not prepCtx: the
+	// instance provider applies its own submission budget to the create request
+	// and a separate boot-wait budget once hcloud has accepted it, so time spent
+	// here can never shorten the wait for a server that already exists.
+	prepCtx, cancelPrep := context.WithTimeout(ctx, cp.budgets.CreateSubmit)
+	defer cancelPrep()
+	nodeClass, err := cp.resolveNodeClass(prepCtx, nodeClaim.Spec.NodeClassRef)
 	if err != nil {
 		return nil, fmt.Errorf("resolving node class: %w", err)
 	}
@@ -167,7 +184,7 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	// can disagree. The gate defaults off. This is closable here rather than upstream:
 	// Create needs the nodeoverlay store, not the decorator, and the store is public and
 	// already held in main.go. Left to a follow-up to keep this change reviewable.
-	instanceTypes, err := cp.typeProvider.List(ctx, nodeClass)
+	instanceTypes, err := cp.typeProvider.List(prepCtx, nodeClass)
 	if err != nil {
 		return nil, fmt.Errorf("listing instance types: %w", err)
 	}
@@ -259,7 +276,7 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	// Re-checking it here would compare the architecture against itself: on the status
 	// path resolveImage reports the architecture the entry was filed under, not one read
 	// back from hcloud.
-	image, err := cp.resolveImage(ctx, nodeClass, hcloudArch)
+	image, err := cp.resolveImage(prepCtx, nodeClass, hcloudArch)
 	if err != nil {
 		return nil, err
 	}
@@ -272,10 +289,14 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	nodePoolName := nodeClaim.Labels[karpv1.NodePoolLabelKey]
 
 	// Resolve userData, preferring the Secret reference over inline userData.
-	userData, err := cp.resolveUserData(ctx, nodeClass)
+	userData, err := cp.resolveUserData(prepCtx, nodeClass)
 	if err != nil {
 		return nil, fmt.Errorf("resolving userData: %w", err)
 	}
+
+	// Preparation is done; release its budget before the create, which carries
+	// its own.
+	cancelPrep()
 
 	// Create the server.
 	server, err := cp.instanceProvider.Create(ctx, instance.CreateOpts{
@@ -335,11 +356,15 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 
 // Delete terminates the server backing the given NodeClaim.
 func (cp *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Delete)
+	defer cancel()
 	return cp.instanceProvider.Delete(ctx, nodeClaim.Status.ProviderID)
 }
 
 // Get retrieves the NodeClaim corresponding to the given provider ID.
 func (cp *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.NodeClaim, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	server, err := cp.instanceProvider.Get(ctx, providerID)
 	if err != nil {
 		return nil, err
@@ -352,6 +377,8 @@ func (cp *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.No
 
 // List retrieves all NodeClaims managed by this provider.
 func (cp *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	servers, err := cp.instanceProvider.List(ctx)
 	if err != nil {
 		return nil, err
@@ -365,6 +392,8 @@ func (cp *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) 
 
 // GetInstanceTypes returns the available instance types for the given NodePool.
 func (cp *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*karpcp.InstanceType, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	if nodePool == nil {
 		return cp.typeProvider.List(ctx, nil)
 	}
@@ -407,6 +436,8 @@ func markImagelessArchesUnavailable(its []*karpcp.InstanceType, nodeClass *apiv1
 
 // IsDrifted determines whether the given NodeClaim has drifted from its desired state.
 func (cp *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim) (karpcp.DriftReason, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	log := logf.FromContext(ctx)
 	nodeClass, err := cp.resolveNodeClass(ctx, nodeClaim.Spec.NodeClassRef)
 	if err != nil {
