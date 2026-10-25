@@ -77,9 +77,13 @@ func TestNewHTTPClient_BoundsEveryPhase(t *testing.T) {
 	if c.Timeout != defaultAPITimeout {
 		t.Errorf("Timeout = %s, want %s", c.Timeout, defaultAPITimeout)
 	}
-	tr, ok := c.Transport.(*http.Transport)
+	rl, ok := c.Transport.(rateLimitTransport)
 	if !ok {
-		t.Fatalf("Transport is %T, want *http.Transport", c.Transport)
+		t.Fatalf("Transport is %T, want rateLimitTransport", c.Transport)
+	}
+	tr, ok := rl.next.(*http.Transport)
+	if !ok {
+		t.Fatalf("wrapped transport is %T, want *http.Transport", rl.next)
 	}
 	if tr.TLSHandshakeTimeout <= 0 {
 		t.Error("TLSHandshakeTimeout is unset, so a stalled handshake is bounded only by the whole-request timeout")
