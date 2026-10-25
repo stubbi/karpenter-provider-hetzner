@@ -218,6 +218,23 @@ Hetzner's hourly request budget is per **project** and shared with every client 
 
 `karpenter_hetzner_hcloud_ratelimit_remaining`, `karpenter_hetzner_hcloud_ratelimit_limit` and `karpenter_hetzner_hcloud_ratelimit_reset_timestamp_seconds` mirror the `RateLimit-*` headers of the provider's own requests. Alert on `remaining` falling toward zero; it is the signal that points at the budget when other components start failing at the same time. `karpenter_hetzner_image_cache_total{result}` shows the image cache hit rate.
 
+At startup the controller makes one authenticated read and exits with a clear error if Hetzner rejects `HCLOUD_TOKEN` (unauthorized or forbidden). A timeout or API outage only logs a warning, and the ongoing readiness probe does not depend on the Hetzner API. A read-only token passes this check because it can still read. It fails on the first create instead, with the reason shown below.
+
+### Failed launches
+
+How a failed server create is handled depends on what the hcloud error means:
+
+| hcloud error | Handling |
+|---|---|
+| `resource_unavailable`, `invalid_server_type`, unsupported location | Capacity. That server type is quarantined in that location for 5 minutes, and Karpenter picks another shape. |
+| `resource_limit_exceeded` | Project quota. Nothing is quarantined. The NodeClaim's `Launched` condition shows reason `ProjectQuotaExceeded`. |
+| `unauthorized`, `forbidden`, `token_readonly` | Token problem. `Launched` shows reason `HCloudUnauthorized`, `HCloudForbidden` or `HCloudTokenReadOnly`. |
+| `private_net_only_server` | NodeClass problem: firewalls need a public interface. `Launched` shows reason `PrivateNetOnlyServer`. |
+| `no_subnet_available` | The NodeClass network has no subnet in that location's network zone. `Launched` shows reason `NoSubnetAvailable`. |
+| anything else (rate limits, 5xx, `placement_error`, `uniqueness_error`) | Retried. |
+
+Failed creates and deletes are counted by hcloud error code in `karpenter_hetzner_server_create_errors_total{code}` and `karpenter_hetzner_server_delete_errors_total{code}`. If a delete fails with `protected`, delete protection was turned on outside Karpenter. The NodeClaim stays terminating until someone removes it.
+
 ## Cost notes
 
 - Pricing uses the **net** hourly figure, so relative comparisons match your Hetzner invoice (before VAT).
