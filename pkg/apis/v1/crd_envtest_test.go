@@ -75,3 +75,59 @@ func TestCRD_KubeletAdmission(t *testing.T) {
 		})
 	}
 }
+
+// TestCRD_PlacementGroupAdmission checks spec.placementGroupIDs admission on a
+// real API server: positive IDs only, no duplicates, and never together with
+// placementGroupStrategy none, which would otherwise silently ignore one of them.
+func TestCRD_PlacementGroupAdmission(t *testing.T) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Skip("KUBEBUILDER_ASSETS not set; run make test-envtest")
+	}
+	env := &envtest.Environment{
+		CRDDirectoryPaths:     []string{"../../../charts/karpenter-provider-hetzner/crds"},
+		ErrorIfCRDPathMissing: true,
+	}
+	cfg, err := env.Start()
+	if err != nil {
+		t.Fatalf("installing the CRDs: %v", err)
+	}
+	t.Cleanup(func() { _ = env.Stop() })
+	c, err := client.New(cfg, client.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n := 0
+	for name, tc := range map[string]struct {
+		spec  map[string]any
+		admit bool
+	}{
+		"ids with default strategy": {map[string]any{"placementGroupIDs": []any{int64(1), int64(2)}}, true},
+		"ids with spread":           {map[string]any{"placementGroupIDs": []any{int64(1)}, "placementGroupStrategy": "spread"}, true},
+		"ids with none":             {map[string]any{"placementGroupIDs": []any{int64(1)}, "placementGroupStrategy": "none"}, false},
+		"zero id":                   {map[string]any{"placementGroupIDs": []any{int64(0)}}, false},
+		"duplicate ids":             {map[string]any{"placementGroupIDs": []any{int64(3), int64(3)}}, false},
+		"empty list":                {map[string]any{"placementGroupIDs": []any{}}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			n++
+			spec := map[string]any{
+				"locations":     []any{"nbg1"},
+				"networkID":     int64(1),
+				"imageSelector": map[string]any{"family": "ubuntu"},
+			}
+			for k, v := range tc.spec {
+				spec[k] = v
+			}
+			err := c.Create(context.Background(), &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "karpenter.hetzner.cloud/v1",
+				"kind":       "HCloudNodeClass",
+				"metadata":   map[string]any{"name": fmt.Sprintf("pg-%d", n)},
+				"spec":       spec,
+			}})
+			if (err == nil) != tc.admit {
+				t.Errorf("admitted=%v, want %v (err: %v)", err == nil, tc.admit, err)
+			}
+		})
+	}
+}
