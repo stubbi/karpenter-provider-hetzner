@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-28
+
 ### Added
 - `HCloudNodeClass.spec.kubelet` declares the reservations the node's bootstrap applies (`systemReserved`, `kubeReserved`, `evictionHard`), so Karpenter subtracts them when computing allocatable. Previously only a flat 100m/100Mi `kubeReserved` was subtracted whatever the bootstrap reserved, so Karpenter could pick a server the pod did not fit on, leaving it Pending while the empty node was consolidated and replaced. A NodeClass without the field keeps exactly the previous behaviour; one that declares anything is taken at its word, so the flat 100m/100Mi no longer applies to it. Values are validated at admission; the README shows how to read them off a running node on any distribution (#68).
 - `karpenter_hetzner_hcloud_ratelimit_{limit,remaining,reset_timestamp_seconds}` gauges mirror the hcloud `RateLimit-*` headers of every request the provider makes, and `karpenter_hetzner_image_cache_total{result}` counts image-resolution cache lookups (#70).
@@ -16,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **This release changes the `HCloudNodeClass` CRD.** Helm does not upgrade CRDs: apply them before `helm upgrade` as the README describes, or `spec.kubelet` is dropped by the API server.
 - `karpenter_hetzner_server_delete_errors_total{code}` counts failed deletes by hcloud error code (#65).
 - At startup the controller checks `HCLOUD_TOKEN` with one authenticated read and exits with a clear error if Hetzner rejects it. Transient failures only log a warning (#65).
+
+### Security
+- The release image is built with Go 1.26.10 again (`golang:1.26.10-alpine`, and `go 1.26.10` in go.mod). Dependabot had moved the builder to `golang:1.27.1-alpine` (#75), away from the go.mod toolchain that CI tests with, and both 1.27.1 and 1.26.7 carry standard-library advisories that govulncheck reports as reachable: GO-2026-6809 (crypto/x509) and GO-2026-6603, -6605, -6607, -6608, -6610, -6611, -6612, -6613 and -6617 (net/http, HTTP/2, crypto/tls, net/textproto). All are fixed in 1.26.10. Local builds now require Go >= 1.26.10.
 
 ### Fixed
 - Servers that hcloud created but whose provider ID was never recorded on the NodeClaim were never reclaimed, so they kept running and billing with nothing pointing at them (#61). This happened whenever a create was interrupted after hcloud accepted it: a failed or cancelled action wait, a rolling update, a leader handover. Create is now idempotent. It adopts this cluster's existing server labelled for the NodeClaim, both before creating and on a `uniqueness_error`. A new orphan controller (on by default; `orphanGC.enabled`, `orphanGC.gracePeriod`, default 30m, minimum 15m) deletes servers that carry a `karpenter.sh/nodeclaim` label, are older than the grace period, whose NodeClaim is gone and that no Node references. New metric `karpenter_hetzner_orphaned_servers_reclaimed_total`. Create makes one extra list call to look for an existing server.
@@ -175,7 +180,8 @@ detection, observability, supply-chain attestations, and adoption docs.
 - Grant full Karpenter-core RBAC in Helm chart (#13).
 - Treat `unsupported location for server type` as an unavailable offering rather than a hard error (#16).
 
-[Unreleased]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.1...HEAD
+[Unreleased]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.1...v3.1.0
 [3.0.1]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v2.2.0...v3.0.0
 [2.2.0]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.1.1...v2.2.0
