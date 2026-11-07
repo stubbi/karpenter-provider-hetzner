@@ -28,7 +28,9 @@ const pgRefreshTTL = 10 * time.Minute
 
 // LabelPlacementGroupIndex marks a provider-managed placement group's index
 // within its node pool. Index 0 is the original, un-suffixed group name.
-const LabelPlacementGroupIndex = apiv1.Group + "/placement-group-index"
+// The key must not use apiv1.Group as prefix: Hetzner reserves every label
+// prefix ending in hetzner.cloud and rejects the create call.
+const LabelPlacementGroupIndex = "karpenter.sh/placement-group-index"
 
 // ErrPlacementGroupsFull reports that every operator-supplied placement group
 // is full. The provider never creates groups on the operator's behalf when
