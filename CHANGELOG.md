@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Upgrade Karpenter core to 1.15.1 and refresh the bundled NodeClaim and NodePool CRDs. Apply the updated CRDs before upgrading the chart; Helm does not upgrade them.
+- With the opt-in `NodeRepair` feature gate enabled, unhealthy `Ready=False` and `Ready=Unknown` nodes remain eligible for replacement after five minutes. Karpenter 1.15 uses disruption-based repair by default, so disruption budgets, eviction blockers, and replacement scheduling can defer that replacement. Pass `--legacy-node-repair=true` through the chart's `args` to use the older repair controller. In-place reboot is unsupported and returns Karpenter's terminal unsupported-operation error.
+- Grant pod `patch` permission for Karpenter's optional `PodDeletionCostManagement` feature gate, which is disabled by default. This permits its controller to maintain pod deletion-cost annotations.
+
 ## [3.1.0] - 2026-10-28
 
 ### Added

@@ -100,6 +100,7 @@ func main() {
 			baseCloudProvider,
 			clusterState,
 			op.InstanceTypeStore,
+			op.PredictionStore,
 		),
 		providerControllers...,
 	)...).Start(ctx)
