@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/awslabs/operatorpkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	// Register karpenter core types into the default k8s scheme.
@@ -16,6 +17,7 @@ import (
 
 	hetznercp "github.com/paperclipinc/karpenter-provider-hetzner/pkg/cloudprovider"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/controllers/nodeclass"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/controllers/orphan"
 	hetznerop "github.com/paperclipinc/karpenter-provider-hetzner/pkg/operator"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/imagefamily"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/instance"
@@ -40,6 +42,17 @@ func main() {
 		return
 	}
 
+	// Fail fast on a token Hetzner rejects, instead of starting healthy and failing
+	// every create. Transient failures only warn: see ValidateToken.
+	tokenWarning, err := hetznerop.ValidateToken(ctx, &hcloudClient.Server)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Hetzner API token check failed")
+		return
+	}
+	if tokenWarning != nil {
+		log.FromContext(ctx).Error(tokenWarning, "Hetzner API token check inconclusive")
+	}
+
 	// Create the three providers.
 	instanceProvider := instance.NewProviderWithPlacementGroups(&hcloudClient.Server, &hcloudClient.PlacementGroup, cfg.ClusterName, &hcloudClient.Action)
 	typeProvider := instancetype.NewProvider(&hcloudClient.ServerType)
@@ -62,6 +75,19 @@ func main() {
 	// Our NodeClass status controller (network + image validation, Ready).
 	nodeClassController := nodeclass.NewController(op.GetClient(), &hcloudClient.Network, &hcloudClient.Location, &hcloudClient.Firewall, &hcloudClient.SSHKey, imageProvider)
 
+	providerControllers := []controller.Controller{
+		nodeClassController,
+		// Keeps the NodeClass hash current and stamps NodeClaims launched before it
+		// existed, so NodeClass drift never rolls a fleet on upgrade.
+		nodeclass.NewHashController(op.GetClient()),
+	}
+	if cfg.OrphanGCEnabled {
+		// Reclaims servers created for a NodeClaim that no longer exists and that
+		// never became a Node (#61). Core has no owner for that direction.
+		providerControllers = append(providerControllers,
+			orphan.NewController(op.GetClient(), instanceProvider, cfg.OrphanGCGracePeriod, op.Clock.Now))
+	}
+
 	// Wire and start all controllers.
 	op.WithControllers(ctx, append(
 		controllers.NewControllers(
@@ -75,6 +101,6 @@ func main() {
 			clusterState,
 			op.InstanceTypeStore,
 		),
-		nodeClassController,
+		providerControllers...,
 	)...).Start(ctx)
 }

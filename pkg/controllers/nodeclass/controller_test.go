@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/deadline"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/imagefamily"
 )
 
@@ -688,5 +690,55 @@ func TestResolvedImagesGeneration_AbsentConditionFailsSafe(t *testing.T) {
 	nc.Generation = 2
 	if got := resolvedImagesGeneration(nc); got != 1 {
 		t.Errorf("resolvedImagesGeneration = %d, want 1 (the generation the images were resolved under)", got)
+	}
+}
+
+// hungNetworks blocks until the reconcile's context is done, like a request that
+// never completes, and records whether a deadline was set.
+type hungNetworks struct{ sawDeadline *bool }
+
+func (h hungNetworks) GetByID(ctx context.Context, _ int64) (*hcloud.Network, *hcloud.Response, error) {
+	_, *h.sawDeadline = ctx.Deadline()
+	<-ctx.Done()
+	return nil, nil, ctx.Err()
+}
+
+func TestReconcile_HungAPICallEndsOnTheReconcileBudget(t *testing.T) {
+	_ = apiv1.SchemeBuilder.AddToScheme(scheme.Scheme)
+	nc := newNodeClass()
+	kube := fake.NewClientBuilder().WithScheme(scheme.Scheme).
+		WithObjects(nc).WithStatusSubresource(nc).Build()
+	img := imagefamily.NewProvider(fakeImages{img: &hcloud.Image{ID: 42, Description: "Ubuntu 24.04"}})
+	var sawDeadline bool
+	c := NewController(kube, hungNetworks{sawDeadline: &sawDeadline}, validLocations(), fakeFirewalls{}, fakeSSHKeys{}, img)
+	if c.timeout != deadline.Read {
+		t.Fatalf("default reconcile budget = %s, want deadline.Read (%s)", c.timeout, deadline.Read)
+	}
+	c.timeout = 50 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Reconcile(context.Background(), nc.DeepCopy())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("reconcile never returned: the hung network call has no deadline")
+	}
+	if !sawDeadline {
+		t.Error("network call ran without a deadline")
+	}
+	// The timed-out call must still be reported, so the status write cannot share
+	// the exhausted budget.
+	got := &apiv1.HCloudNodeClass{}
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(nc), got); err != nil {
+		t.Fatal(err)
+	}
+	if cond := got.StatusConditions().Get(apiv1.ConditionTypeNetworkReady); cond == nil || !cond.IsUnknown() {
+		t.Errorf("NetworkReady = %v, want Unknown after the call timed out", cond)
 	}
 }

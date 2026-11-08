@@ -124,3 +124,53 @@ func parseResourceList(in map[string]apiv1.ReservedQuantity) corev1.ResourceList
 	}
 	return out
 }
+
+// capacityFor returns the capacity a node class's servers will register with.
+// The cached catalogue holds Hetzner's advertised figures and is shared by every
+// node class, so a node class that adjusts nothing gets that map back unchanged
+// and one that does gets a fresh copy: the cached map is never mutated.
+//
+// Two adjustments are declarable. maxPods replaces the kubelet's default pod
+// limit of 110, and vmMemoryOverheadPercent removes the share of advertised
+// memory the guest kernel never sees. Both leave capacity as before when unset.
+func capacityFor(nodeClass *apiv1.HCloudNodeClass, base corev1.ResourceList) corev1.ResourceList {
+	if nodeClass == nil {
+		return base
+	}
+	var maxPods *int32
+	if nodeClass.Spec.Kubelet != nil {
+		maxPods = nodeClass.Spec.Kubelet.MaxPods
+	}
+	overhead := vmMemoryOverheadFraction(nodeClass.Spec.VMMemoryOverheadPercent)
+	if maxPods == nil && overhead == 0 {
+		return base
+	}
+	out := base.DeepCopy()
+	if maxPods != nil {
+		out[corev1.ResourcePods] = *resource.NewQuantity(int64(*maxPods), resource.DecimalSI)
+	}
+	if mem, ok := base[corev1.ResourceMemory]; ok && overhead > 0 {
+		// Rounded down to whole MiB, like the kernel-reported figure Karpenter
+		// will later compare against, so the model never claims a partial MiB the
+		// guest does not have.
+		visible := int64(float64(mem.Value()) * (1 - overhead))
+		visible -= visible % (1 << 20)
+		out[corev1.ResourceMemory] = *resource.NewQuantity(visible, resource.BinarySI)
+	}
+	return out
+}
+
+// vmMemoryOverheadFraction parses vmMemoryOverheadPercent into a fraction. The
+// CRD admits only 0 to 49.99 with up to two decimals (pinned by
+// TestCRDPatterns), so anything unparseable or out of range is unreachable for a
+// stored object and is treated as unset rather than guessed at.
+func vmMemoryOverheadFraction(raw string) float64 {
+	if raw == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil || f <= 0 || f >= 50 {
+		return 0
+	}
+	return f / 100
+}

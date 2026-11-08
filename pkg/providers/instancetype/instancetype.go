@@ -181,9 +181,9 @@ func (p *Provider) MarkUnavailable(serverType, location string) {
 //
 // The returned InstanceType and Offering structs are fresh value-copies, so
 // setting Available never mutates the cached entries, and Overhead is built
-// fresh per call. Requirements and Capacity are intentionally shared with the
-// cache, not deep-copied: callers must treat returned types as read-only and
-// must not mutate those maps.
+// fresh per call. Requirements, and Capacity when the node class adjusts
+// nothing, are intentionally shared with the cache, not deep-copied: callers
+// must treat returned types as read-only and must not mutate those maps.
 func (p *Provider) applyAvailability(types []*cloudprovider.InstanceType, nodeClass *apiv1.HCloudNodeClass) []*cloudprovider.InstanceType {
 	out := make([]*cloudprovider.InstanceType, len(types))
 	for i, it := range types {
@@ -199,12 +199,15 @@ func (p *Provider) applyAvailability(types []*cloudprovider.InstanceType, nodeCl
 		// Construct a fresh InstanceType (rather than copying *it) to avoid
 		// copying the embedded sync.Once (govet copylocks); Requirements/Capacity
 		// are intentionally shared read-only with the cached entry.
+		// Capacity is node-class-specific when the class declares maxPods or a VM
+		// memory overhead; capacityFor copies rather than mutates the cached map.
+		capacity := capacityFor(nodeClass, it.Capacity)
 		out[i] = &cloudprovider.InstanceType{
 			Name:         it.Name,
 			Offerings:    offerings,
 			Requirements: it.Requirements,
-			Capacity:     it.Capacity,
-			Overhead:     overheadFor(nodeClass, it.Capacity),
+			Capacity:     capacity,
+			Overhead:     overheadFor(nodeClass, capacity),
 		}
 	}
 	return out

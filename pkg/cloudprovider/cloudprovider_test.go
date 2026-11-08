@@ -95,12 +95,28 @@ func (f *fakeServerClient) GetByID(_ context.Context, id int64) (*hcloud.Server,
 	return f.servers[id], nil, nil
 }
 
-func (f *fakeServerClient) AllWithOpts(_ context.Context, _ hcloud.ServerListOpts) ([]*hcloud.Server, error) {
+func (f *fakeServerClient) AllWithOpts(_ context.Context, opts hcloud.ServerListOpts) ([]*hcloud.Server, error) {
 	out := make([]*hcloud.Server, 0, len(f.servers))
 	for _, s := range f.servers {
-		out = append(out, s)
+		if matchesLabelSelector(s.Labels, opts.LabelSelector) {
+			out = append(out, s)
+		}
 	}
 	return out, nil
+}
+
+// matchesLabelSelector evaluates an equality-only hcloud label selector ("a=b,c=d").
+func matchesLabelSelector(labels map[string]string, selector string) bool {
+	if selector == "" {
+		return true
+	}
+	for _, term := range strings.Split(selector, ",") {
+		k, v, _ := strings.Cut(term, "=")
+		if got, ok := labels[k]; !ok || got != v {
+			return false
+		}
+	}
+	return true
 }
 
 type fakeServerTypeClient struct{ types []*hcloud.ServerType }
@@ -384,8 +400,10 @@ func TestGet_Found(t *testing.T) {
 
 func TestList_ReturnsManagedServers(t *testing.T) {
 	cp, fsc, _ := buildCPWithTypes(t, baselineNodeClass(), []*hcloud.ServerType{cx22Type()})
-	fsc.servers[1] = &hcloud.Server{ID: 1, ServerType: &hcloud.ServerType{Name: "cx22"}}
-	fsc.servers[2] = &hcloud.Server{ID: 2, ServerType: &hcloud.ServerType{Name: "cx22"}}
+	managed := map[string]string{apiv1.ServerLabelManagedBy: apiv1.ServerValueManagedBy, apiv1.ServerLabelCluster: "test-cluster"}
+	fsc.servers[1] = &hcloud.Server{ID: 1, ServerType: &hcloud.ServerType{Name: "cx22"}, Labels: managed}
+	fsc.servers[2] = &hcloud.Server{ID: 2, ServerType: &hcloud.ServerType{Name: "cx22"}, Labels: managed}
+	fsc.servers[3] = &hcloud.Server{ID: 3, ServerType: &hcloud.ServerType{Name: "cx22"}} // not ours
 	list, err := cp.List(context.Background())
 	if err != nil {
 		t.Fatal(err)

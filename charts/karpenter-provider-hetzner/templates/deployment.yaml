@@ -68,6 +68,10 @@ spec:
               value: {{ .Values.clusterName | quote }}
             - name: HCLOUD_API_TIMEOUT
               value: {{ .Values.hcloud.apiTimeout | quote }}
+            - name: ORPHAN_GC_ENABLED
+              value: {{ .Values.orphanGC.enabled | quote }}
+            - name: ORPHAN_GC_GRACE_PERIOD
+              value: {{ .Values.orphanGC.gracePeriod | quote }}
             - name: METRICS_PORT
               value: {{ .Values.metrics.port | quote }}
             - name: HEALTH_PROBE_PORT

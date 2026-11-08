@@ -20,11 +20,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/deadline"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/metrics"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/imagefamily"
 )
 
-const resyncInterval = 5 * time.Minute
+const (
+	resyncInterval = 5 * time.Minute
+
+	// statusWriteTimeout bounds the status update at the end of a reconcile. It
+	// is an API-server write, independent of the hcloud budget.
+	statusWriteTimeout = 30 * time.Second
+)
 
 // NetworkGetter is the narrow hcloud networks API the controller needs.
 type NetworkGetter interface {
@@ -55,10 +62,13 @@ type Controller struct {
 	sshKeys    SSHKeyGetter
 	images     *imagefamily.Provider
 	recorder   events.EventRecorder
+	// timeout bounds one reconcile (see deadline.Read). controller-runtime
+	// imposes none, so without it a slow API call holds the worker indefinitely.
+	timeout time.Duration
 }
 
 func NewController(kubeClient client.Client, networks NetworkGetter, locations LocationLister, firewalls FirewallGetter, sshKeys SSHKeyGetter, images *imagefamily.Provider) *Controller {
-	return &Controller{kubeClient: kubeClient, networks: networks, locations: locations, firewalls: firewalls, sshKeys: sshKeys, images: images}
+	return &Controller{kubeClient: kubeClient, networks: networks, locations: locations, firewalls: firewalls, sshKeys: sshKeys, images: images, timeout: deadline.Read}
 }
 
 // warnf emits a Warning event on the HCloudNodeClass when a recorder is
@@ -73,6 +83,13 @@ func (c *Controller) warnf(nc *apiv1.HCloudNodeClass, reason, action, format str
 func (c *Controller) Name() string { return "nodeclass.status" }
 
 func (c *Controller) Reconcile(ctx context.Context, nc *apiv1.HCloudNodeClass) (reconcile.Result, error) {
+	// A handful of bounded GETs plus image resolution and a status write. The
+	// transient-error paths below already treat a timed-out call like any other
+	// unreadable API (Unknown, previous images preserved), so a deadline here can
+	// only shorten a stall, never discard good state.
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	stored := nc.DeepCopy()
 
 	// Network validation.
@@ -208,7 +225,12 @@ func (c *Controller) Reconcile(ctx context.Context, nc *apiv1.HCloudNodeClass) (
 	}
 
 	if !equality.Semantic.DeepEqual(stored, nc) {
-		if err := c.kubeClient.Status().Update(ctx, nc); err != nil {
+		// Written under its own short budget from the caller's context, not the
+		// reconcile budget: when the hcloud calls above ran the budget out, the
+		// Unknown conditions they produced are exactly what must reach status.
+		writeCtx, cancelWrite := context.WithTimeout(parent, statusWriteTimeout)
+		defer cancelWrite()
+		if err := c.kubeClient.Status().Update(writeCtx, nc); err != nil {
 			return reconcile.Result{}, err
 		}
 	}

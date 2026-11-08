@@ -7,15 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-28
+
 ### Added
 - `HCloudNodeClass.spec.kubelet` declares the reservations the node's bootstrap applies (`systemReserved`, `kubeReserved`, `evictionHard`), so Karpenter subtracts them when computing allocatable. Previously only a flat 100m/100Mi `kubeReserved` was subtracted whatever the bootstrap reserved, so Karpenter could pick a server the pod did not fit on, leaving it Pending while the empty node was consolidated and replaced. A NodeClass without the field keeps exactly the previous behaviour; one that declares anything is taken at its word, so the flat 100m/100Mi no longer applies to it. Values are validated at admission; the README shows how to read them off a running node on any distribution (#68).
 - `karpenter_hetzner_hcloud_ratelimit_{limit,remaining,reset_timestamp_seconds}` gauges mirror the hcloud `RateLimit-*` headers of every request the provider makes, and `karpenter_hetzner_image_cache_total{result}` counts image-resolution cache lookups (#70).
 - `HCloudNodeClass.spec.placementGroupIDs` places servers in existing spread placement groups (for example managed in Terraform) instead of provider-managed ones, least-full first. The provider never creates or deletes groups for this list (#69).
+- `HCloudNodeClass.spec.kubelet.maxPods` sets the pod capacity Karpenter advertises (default 110, unchanged), so a Talos or k3s `maxPods` setting is visible to the scheduler (#68).
+- `HCloudNodeClass.spec.vmMemoryOverheadPercent` removes the share of advertised memory the guest kernel never sees (measured at 4.4-6.9% across sizes) from capacity, so allocatable is no longer overstated by the VM gap. Unset keeps the advertised size, as before: this is opt-in rather than a new default because it shrinks every node's allocatable, which would re-pack existing clusters on upgrade (#68).
 - **This release changes the `HCloudNodeClass` CRD.** Helm does not upgrade CRDs: apply them before `helm upgrade` as the README describes, or `spec.kubelet` is dropped by the API server.
+- `karpenter_hetzner_server_delete_errors_total{code}` counts failed deletes by hcloud error code (#65).
+- At startup the controller checks `HCLOUD_TOKEN` with one authenticated read and exits with a clear error if Hetzner rejects it. Transient failures only log a warning (#65).
+
+### Security
+- The release image is built with Go 1.26.10 again (`golang:1.26.10-alpine`, and `go 1.26.10` in go.mod). Dependabot had moved the builder to `golang:1.27.1-alpine` (#75), away from the go.mod toolchain that CI tests with, and both 1.27.1 and 1.26.7 carry standard-library advisories that govulncheck reports as reachable: GO-2026-6809 (crypto/x509) and GO-2026-6603, -6605, -6607, -6608, -6610, -6611, -6612, -6613 and -6617 (net/http, HTTP/2, crypto/tls, net/textproto). All are fixed in 1.26.10. Local builds now require Go >= 1.26.10.
 
 ### Fixed
+- Servers that hcloud created but whose provider ID was never recorded on the NodeClaim were never reclaimed, so they kept running and billing with nothing pointing at them (#61). This happened whenever a create was interrupted after hcloud accepted it: a failed or cancelled action wait, a rolling update, a leader handover. Create is now idempotent. It adopts this cluster's existing server labelled for the NodeClaim, both before creating and on a `uniqueness_error`. A new orphan controller (on by default; `orphanGC.enabled`, `orphanGC.gracePeriod`, default 30m, minimum 15m) deletes servers that carry a `karpenter.sh/nodeclaim` label, are older than the grace period, whose NodeClaim is gone and that no Node references. New metric `karpenter_hetzner_orphaned_servers_reclaimed_total`. Create makes one extra list call to look for an existing server.
 - A node pool on the default `placementGroupStrategy: spread` stopped scaling at 10 nodes, Hetzner's limit for one spread placement group, because the provider reused a single group per node pool unconditionally (#69). It now reads each group's member count, fills the least-full group with room, and rolls over to indexed groups (`karpenter-<cluster>-<nodepool>-1`, `-2`, ...) when all are full. A create that Hetzner refuses with `placement_error` (the group filled between the count and the create) is retried once in another group. The existing un-suffixed group stays index 0, so upgrading keeps using it. The spread guarantee holds only within a group: in a pool larger than 10, nodes in different groups may share a host.
 - The provider used far more of the shared, per-project hcloud request budget than it needed (#70). Waiting for a server to boot polled the action every 500ms (the SDK default), about 40 requests per create; it now backs off from 1s to 5s, about 6–8. The placement group is resolved once per node pool and cached instead of listed on every create, which also stops concurrent creates racing to create duplicate groups. Resolved images are cached for 5 minutes (errors are never cached), so a newly uploaded snapshot is picked up within one or two NodeClass resyncs rather than immediately.
+- Every provider operation now runs under a context deadline, budgeted by call class rather than uniformly: reads (`Get`, `List`, `IsDrifted`, `GetInstanceTypes`, one nodeclass reconcile) 2m, delete 1m, create submission (preparation, placement group, `servers.Create`) 2m, and the boot wait 10m. controller-runtime imposes no per-reconcile deadline, so previously an operation made of many bounded requests could still hold a worker indefinitely. The boot wait is derived from the caller's context, not the submission budget, so a slow submission can never cancel the wait for a server hcloud already accepted (#71).
+- Project quota exhaustion (`resource_limit_exceeded`) no longer quarantines offerings. It used to be treated as a capacity error: every failed create blacklisted the cheapest offering for every NodePool, and the next attempt moved on to the next one, until the whole catalogue was blacked out and events blamed capacity. Quota now shows on the NodeClaim's `Launched` condition with reason `ProjectQuotaExceeded`. Offerings are quarantined only when the error names a server type that cannot be created in a location (#64).
+- Create errors that retrying cannot fix are no longer retried as if they were transient. `unauthorized`, `forbidden`, `token_readonly`, `private_net_only_server` and `no_subnet_available` show on `Launched` with a typed reason. `invalid_server_type` quarantines that server type. `uniqueness_error` and `placement_error` are still retried. A delete blocked by delete protection now says how to clear it (#65).
+
+### Changed
+- **Drift now compares against the NodeClass's desired state (#63). This is a behaviour change: NodeClass edits that previously only affected new nodes now replace existing ones.**
+  - Image drift compares the NodeClaim's launch image with the image the NodeClass currently resolves for its architecture. The previous check compared a server's image with itself and could never fire. It applies only when `imageSelector.version` or `imageSelector.selector` pins the image; a bare selector never drifts on image, so a snapshot upload cannot roll the fleet.
+  - New `NodeClassDrift` reason: `userData`, `userDataSecretRef` (the reference, not the Secret's value), `sshKeyIDs`, `placementGroupStrategy` and `enablePublicIPv4`/`enablePublicIPv6` are hashed and recorded on each NodeClaim (`karpenter.hetzner.cloud/nodeclass-hash`). Editing any of them replaces the nodes launched from the previous value.
+  - Upgrading does not replace nodes. NodeClaims launched before this release carry no hash and are not treated as drifted; the provider records the current hash on them, so **the first edit to one of those fields after upgrading rolls the nodes**. Plan NodeClass changes accordingly, and use NodePool disruption budgets to pace the replacement.
 
 ## [3.0.1] - 2026-10-03
 
@@ -161,7 +180,8 @@ detection, observability, supply-chain attestations, and adoption docs.
 - Grant full Karpenter-core RBAC in Helm chart (#13).
 - Treat `unsupported location for server type` as an unavailable offering rather than a hard error (#16).
 
-[Unreleased]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.1...HEAD
+[Unreleased]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.1...v3.1.0
 [3.0.1]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/stubbi/karpenter-provider-hetzner/compare/v2.2.0...v3.0.0
 [2.2.0]: https://github.com/paperclipinc/karpenter-provider-hetzner/compare/v2.1.1...v2.2.0

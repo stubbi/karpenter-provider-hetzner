@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/deadline"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/metrics"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/imagefamily"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/instance"
@@ -36,6 +37,10 @@ const (
 	DriftServerType karpcp.DriftReason = "ServerTypeDrift"
 	DriftLocation   karpcp.DriftReason = "LocationDrift"
 	DriftLabels     karpcp.DriftReason = "LabelsDrift"
+	// DriftNodeClass reports an edit to a NodeClass field a running server cannot
+	// report back (userData, its Secret reference, SSH keys, placement strategy,
+	// public IPs), detected by comparing the NodeClaim's recorded hash.
+	DriftNodeClass karpcp.DriftReason = "NodeClassDrift"
 )
 
 // CloudProvider implements the Karpenter CloudProvider interface for Hetzner Cloud.
@@ -44,6 +49,7 @@ type CloudProvider struct {
 	instanceProvider *instance.Provider
 	typeProvider     *instancetype.Provider
 	imageProvider    *imagefamily.Provider
+	budgets          deadline.Budgets
 }
 
 // NewCloudProvider creates a new CloudProvider.
@@ -58,7 +64,15 @@ func NewCloudProvider(
 		instanceProvider: instanceProvider,
 		typeProvider:     typeProvider,
 		imageProvider:    imageProvider,
+		budgets:          deadline.Defaults(),
 	}
+}
+
+// WithBudgets replaces the per-class context budgets (see package deadline).
+// Production keeps the defaults; tests shrink them.
+func (cp *CloudProvider) WithBudgets(b deadline.Budgets) *CloudProvider {
+	cp.budgets = b
+	return cp
 }
 
 // Name returns the cloud provider name.
@@ -153,7 +167,14 @@ func hasResolvedImage(nodeClass *apiv1.HCloudNodeClass, arch hcloud.Architecture
 // Create provisions a new Hetzner server for the given NodeClaim.
 func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
 	log := logf.FromContext(ctx)
-	nodeClass, err := cp.resolveNodeClass(ctx, nodeClaim.Spec.NodeClassRef)
+	// Preparation (node class, catalogue, image, userData) runs under the
+	// submission budget. The server create itself is handed ctx, not prepCtx: the
+	// instance provider applies its own submission budget to the create request
+	// and a separate boot-wait budget once hcloud has accepted it, so time spent
+	// here can never shorten the wait for a server that already exists.
+	prepCtx, cancelPrep := context.WithTimeout(ctx, cp.budgets.CreateSubmit)
+	defer cancelPrep()
+	nodeClass, err := cp.resolveNodeClass(prepCtx, nodeClaim.Spec.NodeClassRef)
 	if err != nil {
 		return nil, fmt.Errorf("resolving node class: %w", err)
 	}
@@ -167,7 +188,7 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	// can disagree. The gate defaults off. This is closable here rather than upstream:
 	// Create needs the nodeoverlay store, not the decorator, and the store is public and
 	// already held in main.go. Left to a follow-up to keep this change reviewable.
-	instanceTypes, err := cp.typeProvider.List(ctx, nodeClass)
+	instanceTypes, err := cp.typeProvider.List(prepCtx, nodeClass)
 	if err != nil {
 		return nil, fmt.Errorf("listing instance types: %w", err)
 	}
@@ -259,7 +280,7 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	// Re-checking it here would compare the architecture against itself: on the status
 	// path resolveImage reports the architecture the entry was filed under, not one read
 	// back from hcloud.
-	image, err := cp.resolveImage(ctx, nodeClass, hcloudArch)
+	image, err := cp.resolveImage(prepCtx, nodeClass, hcloudArch)
 	if err != nil {
 		return nil, err
 	}
@@ -272,10 +293,14 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	nodePoolName := nodeClaim.Labels[karpv1.NodePoolLabelKey]
 
 	// Resolve userData, preferring the Secret reference over inline userData.
-	userData, err := cp.resolveUserData(ctx, nodeClass)
+	userData, err := cp.resolveUserData(prepCtx, nodeClass)
 	if err != nil {
 		return nil, fmt.Errorf("resolving userData: %w", err)
 	}
+
+	// Preparation is done; release its budget before the create, which carries
+	// its own.
+	cancelPrep()
 
 	// Create the server.
 	server, err := cp.instanceProvider.Create(ctx, instance.CreateOpts{
@@ -296,8 +321,12 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 		EnablePublicIPv6:       nodeClass.Spec.PublicIPv6Enabled(),
 	})
 	if err != nil {
-		if karpcp.IsInsufficientCapacityError(err) {
-			cp.typeProvider.MarkUnavailable(selected.Name, location)
+		// Quarantine only what the error itself names. Quota exhaustion, a bad
+		// token or a full subnet are not about this offering, and marking it
+		// unavailable for them would walk the whole catalogue into the cache one
+		// failed create at a time, for every NodePool in the cluster (#64).
+		if serverType, loc, ok := instance.QuarantineTarget(err); ok {
+			cp.typeProvider.MarkUnavailable(serverType, loc)
 		}
 		return nil, fmt.Errorf("creating server: %w", err)
 	}
@@ -323,6 +352,15 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 	// Build the hydrated NodeClaim.
 	created := nodeClaim.DeepCopy()
 	created.Labels = labels
+	// Record the hash of the node class this server was built from. Computed from the
+	// spec actually used above rather than copied from the NodeClass annotation, which
+	// may still describe the previous spec if the hash controller has not caught up:
+	// core persists these annotations onto the NodeClaim (PopulateNodeClaimDetails).
+	if created.Annotations == nil {
+		created.Annotations = map[string]string{}
+	}
+	created.Annotations[apiv1.AnnotationNodeClassHash] = nodeClass.Hash()
+	created.Annotations[apiv1.AnnotationNodeClassHashVersion] = apiv1.NodeClassHashVersion
 	created.Status.ProviderID = instance.FormatProviderID(server.ID)
 	created.Status.Capacity = selected.Capacity
 	created.Status.Allocatable = selected.Allocatable()
@@ -335,11 +373,15 @@ func (cp *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim
 
 // Delete terminates the server backing the given NodeClaim.
 func (cp *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Delete)
+	defer cancel()
 	return cp.instanceProvider.Delete(ctx, nodeClaim.Status.ProviderID)
 }
 
 // Get retrieves the NodeClaim corresponding to the given provider ID.
 func (cp *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.NodeClaim, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	server, err := cp.instanceProvider.Get(ctx, providerID)
 	if err != nil {
 		return nil, err
@@ -352,6 +394,8 @@ func (cp *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.No
 
 // List retrieves all NodeClaims managed by this provider.
 func (cp *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	servers, err := cp.instanceProvider.List(ctx)
 	if err != nil {
 		return nil, err
@@ -365,6 +409,8 @@ func (cp *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) 
 
 // GetInstanceTypes returns the available instance types for the given NodePool.
 func (cp *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*karpcp.InstanceType, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	if nodePool == nil {
 		return cp.typeProvider.List(ctx, nil)
 	}
@@ -407,6 +453,8 @@ func markImagelessArchesUnavailable(its []*karpcp.InstanceType, nodeClass *apiv1
 
 // IsDrifted determines whether the given NodeClaim has drifted from its desired state.
 func (cp *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim) (karpcp.DriftReason, error) {
+	ctx, cancel := context.WithTimeout(ctx, cp.budgets.Read)
+	defer cancel()
 	log := logf.FromContext(ctx)
 	nodeClass, err := cp.resolveNodeClass(ctx, nodeClaim.Spec.NodeClassRef)
 	if err != nil {
@@ -429,13 +477,19 @@ func (cp *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCl
 		return reason
 	}
 
-	// Check image drift: compare the resolved image ID recorded in NodeClaim status against
-	// the current server image.
-	if nodeClaim.Status.ImageID != "" && server.Image != nil {
-		currentImageID := strconv.FormatInt(server.Image.ID, 10)
-		if nodeClaim.Status.ImageID != currentImageID {
-			return logDrift(DriftImage, nodeClaim.Status.ProviderID), nil
-		}
+	// Image drift: the image this node was launched from against the image the NodeClass
+	// resolves to now, for the node's architecture. Only when the selector pins
+	// (version or label selector): a bare selector means "newest, whatever that is", and
+	// chasing it would roll the fleet on any matching snapshot upload, including one from
+	// an unrelated pipeline.
+	if imageDrifted(nodeClass, nodeClaim) {
+		return logDrift(DriftImage, nodeClaim.Status.ProviderID), nil
+	}
+
+	// NodeClass drift: the fields a running server cannot report back, compared as
+	// intent against intent through the hash recorded at launch.
+	if nodeClassHashDrifted(nodeClass, nodeClaim) {
+		return logDrift(DriftNodeClass, nodeClaim.Status.ProviderID), nil
 	}
 
 	// Check network drift: ensure the server is attached to the expected network.
@@ -507,11 +561,57 @@ func (cp *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCl
 		}
 	}
 
-	// SSH-key and user-data drift are intentionally not checked: Hetzner does not
-	// reliably expose applied SSH keys or user-data after create, so a comparison
-	// would produce false positives. They are omitted rather than faked.
+	// SSH keys, userData and the other fields Hetzner does not expose after create are
+	// not read back from the server; the NodeClass hash above covers them.
 
 	return "", nil
+}
+
+// imagePinned reports whether the selector names a deliberate image: a version or a
+// label selector. Only then can "the image the NodeClass resolves to" change by intent.
+func imagePinned(sel apiv1.ImageSelector) bool {
+	return sel.Version != "" || len(sel.Selector) > 0
+}
+
+// imageDrifted compares the NodeClaim's launch image against the image the NodeClass
+// currently resolves for the node's architecture. It reports no drift whenever it
+// cannot be sure: an unpinned selector, a NodeClaim without a recorded image or
+// architecture, or a NodeClass whose status has not been resolved for its current
+// generation (CurrentResolvedImages returns nil until the controller catches up, so a
+// repin is never compared against the previous selector's answer).
+func imageDrifted(nodeClass *apiv1.HCloudNodeClass, nodeClaim *karpv1.NodeClaim) bool {
+	if !imagePinned(nodeClass.Spec.ImageSelector) || nodeClaim.Status.ImageID == "" {
+		return false
+	}
+	var arch hcloud.Architecture
+	switch nodeClaim.Labels[corev1.LabelArchStable] {
+	case "amd64":
+		arch = hcloud.ArchitectureX86
+	case "arm64":
+		arch = hcloud.ArchitectureARM
+	default:
+		return false
+	}
+	for _, ri := range nodeClass.CurrentResolvedImages() {
+		if ri.Architecture == string(arch) {
+			return strconv.FormatInt(ri.ImageID, 10) != nodeClaim.Status.ImageID
+		}
+	}
+	return false
+}
+
+// nodeClassHashDrifted compares the hash recorded on the NodeClaim at launch with the
+// NodeClass's current spec. A NodeClaim with no hash, or one produced by a different
+// hashing scheme, is not drifted: that is every NodeClaim launched before this check
+// existed, and treating them as drifted would replace every node in the cluster on
+// upgrade. The hash controller re-stamps those NodeClaims with the current hash, so the
+// next edit after that is detected.
+func nodeClassHashDrifted(nodeClass *apiv1.HCloudNodeClass, nodeClaim *karpv1.NodeClaim) bool {
+	recorded, ok := nodeClaim.Annotations[apiv1.AnnotationNodeClassHash]
+	if !ok || nodeClaim.Annotations[apiv1.AnnotationNodeClassHashVersion] != apiv1.NodeClassHashVersion {
+		return false
+	}
+	return recorded != nodeClass.Hash()
 }
 
 // resolveUserData returns the userData for a NodeClass, reading it from the

@@ -34,19 +34,25 @@ func TestCRD_KubeletAdmission(t *testing.T) {
 	}
 
 	n := 0
-	create := func(kubelet map[string]any) error {
+	createSpec := func(extra map[string]any) error {
 		n++
+		spec := map[string]any{
+			"locations":     []any{"nbg1"},
+			"networkID":     int64(1),
+			"imageSelector": map[string]any{"family": "ubuntu"},
+		}
+		for k, v := range extra {
+			spec[k] = v
+		}
 		return c.Create(context.Background(), &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "karpenter.hetzner.cloud/v1",
 			"kind":       "HCloudNodeClass",
 			"metadata":   map[string]any{"name": fmt.Sprintf("nc-%d", n)},
-			"spec": map[string]any{
-				"locations":     []any{"nbg1"},
-				"networkID":     int64(1),
-				"imageSelector": map[string]any{"family": "ubuntu"},
-				"kubelet":       kubelet,
-			},
+			"spec":       spec,
 		}})
+	}
+	create := func(kubelet map[string]any) error {
+		return createSpec(map[string]any{"kubelet": kubelet})
 	}
 
 	allSignals := map[string]any{}
@@ -67,10 +73,21 @@ func TestCRD_KubeletAdmission(t *testing.T) {
 		"unknown reservation key":  {map[string]any{"kubeReserved": map[string]any{"gpu": "1"}}, false},
 		"kubelet flag syntax":      {map[string]any{"evictionHard": map[string]any{"memory.available": "<400Mi"}}, false},
 		"non-quantity reservation": {map[string]any{"systemReserved": map[string]any{"memory": "512MB"}}, false},
+		"maxPods in range":         {map[string]any{"maxPods": int64(250)}, true},
+		"maxPods zero":             {map[string]any{"maxPods": int64(0)}, false},
+		"maxPods too large":        {map[string]any{"maxPods": int64(5000)}, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := create(tc.kubelet); (err == nil) != tc.admit {
 				t.Errorf("admitted=%v, want %v (err: %v)", err == nil, tc.admit, err)
+			}
+		})
+	}
+
+	for value, admit := range map[string]bool{"7": true, "6.5": true, "50": false, "7%": false} {
+		t.Run("vmMemoryOverheadPercent "+value, func(t *testing.T) {
+			if err := createSpec(map[string]any{"vmMemoryOverheadPercent": value}); (err == nil) != admit {
+				t.Errorf("admitted=%v, want %v (err: %v)", err == nil, admit, err)
 			}
 		})
 	}

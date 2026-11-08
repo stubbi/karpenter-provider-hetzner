@@ -1,6 +1,9 @@
 package operator
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadConfig_RequiresClusterName(t *testing.T) {
 	t.Setenv("CLUSTER_NAME", "")
@@ -26,5 +29,47 @@ func TestLoadConfig_RejectsInvalidClusterName(t *testing.T) {
 		if _, err := LoadConfig(); err == nil {
 			t.Errorf("expected error for invalid cluster name %q", bad)
 		}
+	}
+}
+
+func TestLoadConfig_OrphanGCDefaults(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "c")
+	t.Setenv("ORPHAN_GC_ENABLED", "")
+	t.Setenv("ORPHAN_GC_GRACE_PERIOD", "")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OrphanGCEnabled || cfg.OrphanGCGracePeriod != defaultOrphanGracePeriod {
+		t.Errorf("got enabled=%v grace=%v, want true %v", cfg.OrphanGCEnabled, cfg.OrphanGCGracePeriod, defaultOrphanGracePeriod)
+	}
+}
+
+func TestLoadConfig_OrphanGCSettings(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "c")
+	for name, tc := range map[string]struct {
+		enabled, grace string
+		wantErr        bool
+		wantEnabled    bool
+		wantGrace      time.Duration
+	}{
+		"disabled":         {enabled: "false", wantEnabled: false, wantGrace: defaultOrphanGracePeriod},
+		"longer grace":     {grace: "1h", wantEnabled: true, wantGrace: time.Hour},
+		"minimum grace":    {grace: "15m", wantEnabled: true, wantGrace: 15 * time.Minute},
+		"grace too short":  {grace: "5m", wantErr: true},
+		"grace unparsable": {grace: "soon", wantErr: true},
+		"enabled garbage":  {enabled: "maybe", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("ORPHAN_GC_ENABLED", tc.enabled)
+			t.Setenv("ORPHAN_GC_GRACE_PERIOD", tc.grace)
+			cfg, err := LoadConfig()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err == nil && (cfg.OrphanGCEnabled != tc.wantEnabled || cfg.OrphanGCGracePeriod != tc.wantGrace) {
+				t.Errorf("got enabled=%v grace=%v", cfg.OrphanGCEnabled, cfg.OrphanGCGracePeriod)
+			}
+		})
 	}
 }

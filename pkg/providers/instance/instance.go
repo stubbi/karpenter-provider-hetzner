@@ -14,6 +14,7 @@ import (
 	karpcp "sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/deadline"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/metrics"
 )
 
@@ -52,27 +53,36 @@ type Provider struct {
 	pgMu    sync.Mutex
 	pgPools map[string]*pgPool
 	nowFn   func() time.Time
+
+	budgets deadline.Budgets
 }
 
 // NewProvider returns a Provider that does NOT wait for hcloud actions to
 // complete after server creation and has no placement-group support. Intended
 // for tests; production uses NewProviderWithPlacementGroups.
 func NewProvider(client ServerClient, clusterName string) *Provider {
-	return &Provider{client: client, clusterName: clusterName}
+	return &Provider{client: client, clusterName: clusterName, budgets: deadline.Defaults()}
 }
 
 // NewProviderWithWaiter returns a Provider that blocks after server creation
 // until all hcloud create actions complete, but has no placement-group support.
 // Intended for tests; production uses NewProviderWithPlacementGroups.
 func NewProviderWithWaiter(client ServerClient, clusterName string, waiter ActionWaiter) *Provider {
-	return &Provider{client: client, waiter: waiter, clusterName: clusterName}
+	return &Provider{client: client, waiter: waiter, clusterName: clusterName, budgets: deadline.Defaults()}
 }
 
 // NewProviderWithPlacementGroups returns a Provider that supports placement
 // groups and waits for hcloud create actions to complete. This is the
 // production constructor.
 func NewProviderWithPlacementGroups(client ServerClient, pgClient PlacementGroupClient, clusterName string, waiter ActionWaiter) *Provider {
-	return &Provider{client: client, pgClient: pgClient, waiter: waiter, clusterName: clusterName}
+	return &Provider{client: client, pgClient: pgClient, waiter: waiter, clusterName: clusterName, budgets: deadline.Defaults()}
+}
+
+// WithBudgets replaces the per-class context budgets (see package deadline).
+// Production keeps the defaults; tests shrink them.
+func (p *Provider) WithBudgets(b deadline.Budgets) *Provider {
+	p.budgets = b
+	return p
 }
 
 // CreateOpts contains all parameters needed to create a Hetzner server node.
@@ -132,9 +142,57 @@ func errorCode(err error) string {
 	return "other"
 }
 
+// findForNodeClaim returns the server this cluster already created for a
+// NodeClaim, or nil. Every server carries the karpenter.sh/nodeclaim label, so a
+// create that is retried after hcloud accepted it -- the action wait failed, the
+// context was cancelled by a rolling update or a leader handover, the process
+// died -- finds the first attempt's server here instead of creating a second one
+// and orphaning the first (#61).
+func (p *Provider) findForNodeClaim(ctx context.Context, nodeClaim string) (*hcloud.Server, error) {
+	servers, err := p.client.AllWithOpts(ctx, hcloud.ServerListOpts{
+		ListOpts: hcloud.ListOpts{
+			LabelSelector: fmt.Sprintf("%s=%s,%s=%s,%s=%s",
+				apiv1.ServerLabelManagedBy, apiv1.ServerValueManagedBy,
+				apiv1.ServerLabelCluster, p.clusterName,
+				apiv1.ServerLabelNodeClaim, nodeClaim),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("looking up existing server for nodeclaim %q: %w", nodeClaim, err)
+	}
+	for _, s := range servers {
+		// A server already being deleted cannot be adopted; creating a fresh one
+		// is right, and its name is free again once the delete completes.
+		if s.Status == hcloud.ServerStatusDeleting {
+			continue
+		}
+		return s, nil
+	}
+	return nil, nil
+}
+
 // create is the internal implementation of Create, instrumented by Create().
 func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server, error) {
 	log := logf.FromContext(ctx)
+	// Everything up to hcloud accepting the request (the adoption lookup,
+	// placement-group resolution and servers.Create) runs under the submission
+	// budget. The boot wait below gets its own budget derived from ctx, not from
+	// submitCtx: once the server exists, the submission deadline must not be able
+	// to cancel the wait and orphan it (#61), while a cancellation of ctx itself
+	// still ends the wait.
+	submitCtx, cancelSubmit := context.WithTimeout(ctx, p.budgets.CreateSubmit)
+	defer cancelSubmit()
+	if opts.NodeClaim != "" {
+		existing, err := p.findForNodeClaim(submitCtx, opts.NodeClaim)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			log.Info("adopting server already created for this nodeclaim",
+				"name", opts.Name, "serverID", existing.ID, "nodeClaim", opts.NodeClaim)
+			return existing, nil
+		}
+	}
 	labels := make(map[string]string, len(opts.Labels)+3)
 	for k, v := range opts.Labels {
 		labels[k] = v
@@ -196,7 +254,7 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 		var pgKey string
 		if usePG {
 			var err error
-			pgID, pgKey, err = p.acquirePlacementGroup(ctx, opts, excluded)
+			pgID, pgKey, err = p.acquirePlacementGroup(submitCtx, opts, excluded)
 			if err != nil {
 				return nil, fmt.Errorf("resolving placement group: %w", err)
 			}
@@ -204,7 +262,7 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 		}
 
 		var err error
-		result, _, err = p.client.Create(ctx, createOpts)
+		result, _, err = p.client.Create(submitCtx, createOpts)
 		if err == nil {
 			break
 		}
@@ -230,8 +288,20 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 				p.releasePlacementGroup(pgKey, pgID)
 			}
 		}
-		return nil, MapCreateError(err)
+		// A duplicate name means an earlier attempt for this NodeClaim got as far
+		// as hcloud, e.g. its create raced this one. Adopt that server rather than
+		// failing the launch and leaving it behind.
+		if opts.NodeClaim != "" && hcloud.IsError(err, hcloud.ErrorCodeUniquenessError) {
+			existing, lookupErr := p.findForNodeClaim(submitCtx, opts.NodeClaim)
+			if lookupErr == nil && existing != nil {
+				log.Info("adopting server after a duplicate-name create",
+					"name", opts.Name, "serverID", existing.ID, "nodeClaim", opts.NodeClaim)
+				return existing, nil
+			}
+		}
+		return nil, MapCreateError(err, opts.ServerType, opts.Location)
 	}
+	cancelSubmit()
 
 	// Wait for the create action and any follow-up actions so we only return a
 	// server that is actually being provisioned.
@@ -242,7 +312,9 @@ func (p *Provider) create(ctx context.Context, opts CreateOpts) (*hcloud.Server,
 		}
 		actions = append(actions, result.NextActions...)
 		if len(actions) > 0 {
-			if err := p.waiter.WaitFor(ctx, actions...); err != nil {
+			waitCtx, cancelWait := context.WithTimeout(ctx, p.budgets.BootWait)
+			defer cancelWait()
+			if err := p.waiter.WaitFor(waitCtx, actions...); err != nil {
 				return nil, fmt.Errorf("waiting for server %q create actions: %w", opts.Name, err)
 			}
 		}
@@ -274,6 +346,7 @@ func (p *Provider) Delete(ctx context.Context, providerID string) error {
 	result := metrics.ResultSuccess
 	if err != nil && !karpcp.IsNodeClaimNotFoundError(err) {
 		result = metrics.ResultError
+		metrics.RecordServerDeleteError(errorCode(err))
 	}
 	metrics.RecordServerDelete(result)
 	return err
@@ -281,6 +354,8 @@ func (p *Provider) Delete(ctx context.Context, providerID string) error {
 
 // delete is the internal implementation of Delete, instrumented by Delete().
 func (p *Provider) delete(ctx context.Context, providerID string) error {
+	ctx, cancel := context.WithTimeout(ctx, p.budgets.Delete)
+	defer cancel()
 	log := logf.FromContext(ctx)
 	id, err := ParseProviderID(providerID)
 	if err != nil {
@@ -317,6 +392,14 @@ func (p *Provider) delete(ctx context.Context, providerID string) error {
 		if hcloud.IsError(err, hcloud.ErrorCodeNotFound) {
 			return karpcp.NewNodeClaimNotFoundError(fmt.Errorf("server %d not found", id))
 		}
+		if hcloud.IsError(err, hcloud.ErrorCodeProtected) {
+			// Delete protection was enabled out of band. Retrying cannot clear it,
+			// so say exactly what to do: the NodeClaim stays terminating (and its
+			// finalizer in place) until someone removes the protection.
+			return fmt.Errorf("deleting server %d (%s): delete protection is enabled on the server; "+
+				"disable it in the Hetzner console or with `hcloud server disable-protection %d delete` "+
+				"so the NodeClaim can finalize: %w", id, server.Name, id, err)
+		}
 		return fmt.Errorf("deleting server %d: %w", id, err)
 	}
 	return nil
@@ -324,6 +407,8 @@ func (p *Provider) delete(ctx context.Context, providerID string) error {
 
 // Get retrieves the server identified by providerID. Returns nil if not found.
 func (p *Provider) Get(ctx context.Context, providerID string) (*hcloud.Server, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.budgets.Read)
+	defer cancel()
 	id, err := ParseProviderID(providerID)
 	if err != nil {
 		return nil, fmt.Errorf("parsing provider ID %q: %w", providerID, err)
@@ -341,6 +426,8 @@ func (p *Provider) Get(ctx context.Context, providerID string) (*hcloud.Server, 
 
 // List returns all servers managed by this Karpenter instance.
 func (p *Provider) List(ctx context.Context) ([]*hcloud.Server, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.budgets.Read)
+	defer cancel()
 	opts := hcloud.ServerListOpts{
 		ListOpts: hcloud.ListOpts{
 			LabelSelector: fmt.Sprintf("%s=%s,%s=%s",

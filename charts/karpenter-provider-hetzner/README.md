@@ -93,7 +93,7 @@ unchanged.
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy |
 | `auth.secretRef.name` | `hcloud-token` | Secret holding the Hetzner token |
 | `auth.secretRef.key` | `token` | Key within the secret |
-| `hcloud.apiTimeout` | `30s` | Bounds a single hcloud HTTP request (Go duration, max `5m`). Per request, not per operation |
+| `hcloud.apiTimeout` | `30s` | Bounds a single hcloud HTTP request (Go duration, max `5m`). Per request, not per operation; operations are additionally bounded by fixed per-class budgets (reads 2m, delete 1m, create submission 2m, boot wait 10m) |
 | `serviceAccount.create` | `true` | Create the service account |
 | `serviceAccount.name` | `""` (release-scoped name) | Service account name |
 | `metrics.port` | `8080` | Prometheus metrics port |

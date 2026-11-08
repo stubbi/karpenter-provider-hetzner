@@ -21,7 +21,7 @@ version tag in production.
 - **All Hetzner Cloud server types** — CX, CPX, CAX, CCX, including ARM (CAX).
 - **Cost-optimal scheduling** — offerings are priced from Hetzner's live per-hour net price, so Karpenter bin-packs onto the cheapest type that fits.
 - **Capacity-aware** — when Hetzner reports a type as unavailable in a location, that offering is skipped for a short window so scheduling falls back to an alternative instead of looping on a sold-out combination.
-- **Drift detection** — image, network, firewall, and server-type drift trigger node replacement.
+- **Drift detection** — image (pinned selectors only), NodeClass spec (userData, SSH keys, placement, public IPs), network, firewall, location, label and server-type drift trigger node replacement. See [Drift](#drift).
 - **Talos Linux and Ubuntu images**, resolved per architecture.
 - **Placement groups** for spreading nodes across physical hosts.
 - **Cost controls** — opt out of the billed public IPv4 (and/or IPv6) per node class for private-network clusters.
@@ -166,9 +166,22 @@ Provisioned nodes carry, in addition to the well-known Karpenter labels:
 | `labels` | `map[string]string` | no | — | Extra hcloud labels on the Hetzner server (useful for cost attribution or firewall label-selectors) |
 | `userData` | `string` | no | — | Inline cloud-init / Talos machine config. Overridden by `userDataSecretRef` when both are set. |
 | `userDataSecretRef` | `object {namespace, name, key}` | no | — | Source `userData` from a Secret instead of inline. The Secret is read at server-create time; its value never appears in the NodeClass spec or git. Takes precedence over `userData`. |
-| `kubelet` | `object {systemReserved, kubeReserved, evictionHard}` | no | `kubeReserved: {cpu: 100m, memory: 100Mi}` | The reservations your `userData` configures on the kubelet, so Karpenter subtracts them from allocatable. Descriptive only, the provider does not configure the kubelet: keep it in agreement with your bootstrap. Without it (or with it empty) only the default shown is subtracted; once it declares anything, it is taken at its word. `evictionHard` takes a quantity or a percentage of capacity, without the kubelet flag's `<`; a signal you leave out is assumed at the kubelet default (`memory.available: 100Mi`, `nodefs.available: 10%`), so declare `"0%"` for one your kubelet does not enforce. To read the values off a running node on any distribution: `kubectl get --raw /api/v1/nodes/<node>/proxy/configz \| jq '.kubeletconfig \| {systemReserved, kubeReserved, evictionHard}'`. |
+| `kubelet` | `object {systemReserved, kubeReserved, evictionHard, maxPods}` | no | `kubeReserved: {cpu: 100m, memory: 100Mi}` | The reservations your `userData` configures on the kubelet, so Karpenter subtracts them from allocatable. Descriptive only, the provider does not configure the kubelet: keep it in agreement with your bootstrap. Without it (or with it empty) only the default shown is subtracted; once it declares anything, it is taken at its word. `evictionHard` takes a quantity or a percentage of capacity, without the kubelet flag's `<`; a signal you leave out is assumed at the kubelet default (`memory.available: 100Mi`, `nodefs.available: 10%`), so declare `"0%"` for one your kubelet does not enforce. To read the values off a running node on any distribution: `kubectl get --raw /api/v1/nodes/<node>/proxy/configz \| jq '.kubeletconfig \| {systemReserved, kubeReserved, evictionHard, maxPods}'`. `maxPods` (1-1024, default 110) is the pod capacity Karpenter advertises; set it to your kubelet's `maxPods`. It does not affect how reservations are read. |
+| `vmMemoryOverheadPercent` | `string` (`0`-`49.99`) | no | — (advertised memory) | Share of the advertised memory the guest kernel never sees, removed from capacity before reservations. Measured on registered nodes the gap is about 6.9% (4 GB), 5.4% (8 GB), 4.7% (16 GB) and 4.4% (32 GB), so `"7"` keeps every size at or below what it registers with. Pick the value for the smallest type the node class can launch: a higher value only undersells larger types, a lower one oversells smaller ones. |
+
+Why the default `kubeReserved` is a flat 100m/100Mi rather than a curve scaled by cores and memory: the kubelet reserves nothing by default, and what a node actually reserves is whatever its bootstrap writes into the kubelet config. A GKE/EKS-style tiered formula would be wrong for every bootstrap this provider supports, so the provider keeps the historical flat default (changing it would silently move every existing node's allocatable) and makes the real values declarable through `kubelet` instead.
 
 Status exposes `conditions` (`ImagesReady`, `NetworkReady`, `ResourcesReady`, `UserDataReady`, aggregated into `Ready`) and `resolvedImages` (image ID per architecture).
+
+### Drift
+
+A node is replaced (`Drifted`) when it no longer matches its NodeClass:
+
+- **Observed on the server**: network, firewalls (every declared one attached), location (still allowed), labels (every declared one present) and server type are compared live, which also catches out-of-band changes.
+- **Image**: compared against the image the NodeClass resolves now for the node's architecture, **only when `imageSelector` pins it** with `version` or `selector`. A bare selector means "the newest matching image", and following it would roll the whole fleet whenever someone uploads a matching snapshot, so it never drifts on image. To roll nodes onto a new image, pin the selector and change the pin.
+- **Not observable on the server**: `userData`, `userDataSecretRef` (the reference, not the Secret's contents), `sshKeyIDs`, `placementGroupStrategy`, `enablePublicIPv4` and `enablePublicIPv6` are hashed. The hash is recorded on each NodeClaim at launch (`karpenter.hetzner.cloud/nodeclass-hash`), and an edit to any of these fields rolls nodes. Rotating the contents of a userData Secret does not; change the reference to roll deliberately. `kubelet` and `vmMemoryOverheadPercent` only describe nodes to the scheduler, so they do not roll nodes.
+
+On upgrade to the first release with the hash, existing NodeClaims have no recorded hash. They are not treated as drifted. The provider records the current hash on them instead, so upgrading replaces nothing and the first NodeClass edit after that rolls them.
 
 ## Examples
 
@@ -197,6 +210,17 @@ comments explaining every field.
 | `CLUSTER_NAME` | yes | Cluster identifier; scopes managed servers |
 | `METRICS_PORT` | no (8080) | Prometheus metrics port |
 | `HEALTH_PROBE_PORT` | no (8081) | Health/readiness probe port |
+| `ORPHAN_GC_ENABLED` | no (`true`) | Reclaim orphaned servers (chart: `orphanGC.enabled`); see below |
+| `ORPHAN_GC_GRACE_PERIOD` | no (`30m`, min `15m`) | Minimum server age before it can be reclaimed (chart: `orphanGC.gracePeriod`) |
+
+### Orphaned servers
+
+A server can outlive its NodeClaim without ever being recorded on it: hcloud accepts the create, then the controller restarts (rolling update, leader handover, OOM) while the server boots, so no provider ID is written and core never deletes it. Two mechanisms close this:
+
+- **Adoption.** Every server carries a `karpenter.sh/nodeclaim` label. Before creating, the provider looks for this cluster's server with that label and adopts it, and it does the same when hcloud rejects a create as a duplicate name. A retried create therefore never makes a second server.
+- **Orphan reclaim.** Every 5 minutes the controller lists this cluster's managed servers and deletes a server only if it carries a `karpenter.sh/nodeclaim` label, is older than `ORPHAN_GC_GRACE_PERIOD`, its NodeClaim no longer exists, and no Node references its provider ID. Servers without the label are never touched. Reclaims are counted in `karpenter_hetzner_orphaned_servers_reclaimed_total`.
+
+Both rely on `CLUSTER_NAME`: two clusters must never share one in a Hetzner project.
 
 ### API budget
 
@@ -206,6 +230,23 @@ Hetzner's hourly request budget is per **project** and shared with every client 
 - Placement-group IDs are resolved once per node pool and cached; resolved images are cached for 5 minutes.
 
 `karpenter_hetzner_hcloud_ratelimit_remaining`, `karpenter_hetzner_hcloud_ratelimit_limit` and `karpenter_hetzner_hcloud_ratelimit_reset_timestamp_seconds` mirror the `RateLimit-*` headers of the provider's own requests. Alert on `remaining` falling toward zero; it is the signal that points at the budget when other components start failing at the same time. `karpenter_hetzner_image_cache_total{result}` shows the image cache hit rate.
+
+At startup the controller makes one authenticated read and exits with a clear error if Hetzner rejects `HCLOUD_TOKEN` (unauthorized or forbidden). A timeout or API outage only logs a warning, and the ongoing readiness probe does not depend on the Hetzner API. A read-only token passes this check because it can still read. It fails on the first create instead, with the reason shown below.
+
+### Failed launches
+
+How a failed server create is handled depends on what the hcloud error means:
+
+| hcloud error | Handling |
+|---|---|
+| `resource_unavailable`, `invalid_server_type`, unsupported location | Capacity. That server type is quarantined in that location for 5 minutes, and Karpenter picks another shape. |
+| `resource_limit_exceeded` | Project quota. Nothing is quarantined. The NodeClaim's `Launched` condition shows reason `ProjectQuotaExceeded`. |
+| `unauthorized`, `forbidden`, `token_readonly` | Token problem. `Launched` shows reason `HCloudUnauthorized`, `HCloudForbidden` or `HCloudTokenReadOnly`. |
+| `private_net_only_server` | NodeClass problem: firewalls need a public interface. `Launched` shows reason `PrivateNetOnlyServer`. |
+| `no_subnet_available` | The NodeClass network has no subnet in that location's network zone. `Launched` shows reason `NoSubnetAvailable`. |
+| anything else (rate limits, 5xx, `placement_error`, `uniqueness_error`) | Retried. |
+
+Failed creates and deletes are counted by hcloud error code in `karpenter_hetzner_server_create_errors_total{code}` and `karpenter_hetzner_server_delete_errors_total{code}`. If a delete fails with `protected`, delete protection was turned on outside Karpenter. The NodeClaim stays terminating until someone removes it.
 
 ## Cost notes
 
