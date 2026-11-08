@@ -534,6 +534,19 @@ func (m *mockPlacementGroupClient) addServer(groupID, serverID int64) error {
 	return hcloud.Error{Code: hcloud.ErrorCodeNotFound, Message: "placement group not found"}
 }
 
+// checkReservedLabelPrefix mirrors the Hetzner API, which rejects label keys
+// whose prefix is hetzner.cloud or ends in .hetzner.cloud
+// ("labels: key contains a reserved prefix").
+func checkReservedLabelPrefix(labels map[string]string) error {
+	for k := range labels {
+		prefix, _, found := strings.Cut(k, "/")
+		if found && (prefix == "hetzner.cloud" || strings.HasSuffix(prefix, ".hetzner.cloud")) {
+			return hcloud.Error{Code: hcloud.ErrorCodeInvalidInput, Message: "invalid input in field 'labels': key contains a reserved prefix: " + k}
+		}
+	}
+	return nil
+}
+
 func (m *mockPlacementGroupClient) Create(_ context.Context, opts hcloud.PlacementGroupCreateOpts) (hcloud.PlacementGroupCreateResult, *hcloud.Response, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -541,6 +554,9 @@ func (m *mockPlacementGroupClient) Create(_ context.Context, opts hcloud.Placeme
 	m.createCalls++
 	if m.createErr != nil {
 		return hcloud.PlacementGroupCreateResult{}, nil, m.createErr
+	}
+	if err := checkReservedLabelPrefix(opts.Labels); err != nil {
+		return hcloud.PlacementGroupCreateResult{}, nil, err
 	}
 	for _, pg := range m.groups {
 		if pg.Name == opts.Name {
