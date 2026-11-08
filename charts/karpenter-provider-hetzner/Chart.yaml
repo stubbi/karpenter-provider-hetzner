@@ -2,8 +2,8 @@ apiVersion: v2
 name: karpenter-provider-hetzner
 description: Karpenter cloud provider for Hetzner Cloud
 type: application
-version: 3.0.1
-appVersion: "3.0.1"
+version: 3.1.0
+appVersion: "3.1.0"
 # home points at Paperclip.inc (the project's canonical page) so listing
 # "Homepage" links drive backlinks to the domain; GitHub stays as source.
 home: https://paperclip.inc/karpenter-hetzner

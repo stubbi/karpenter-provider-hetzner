@@ -1,6 +1,6 @@
 # Cross-compile from the native build platform to the target platform so multi-arch
 # builds don't run `go build` under slow QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS builder
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /app

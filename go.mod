@@ -1,6 +1,6 @@
 module github.com/paperclipinc/karpenter-provider-hetzner
 
-go 1.26.7
+go 1.26.10
 
 require (
 	github.com/awslabs/operatorpkg v0.0.0-20260708223819-4da4c353c5fa
