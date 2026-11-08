@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	corev1 "k8s.io/api/core/v1"
@@ -15,6 +16,8 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	karpcp "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/cloudprovider"
@@ -50,6 +53,48 @@ func TestRepairPolicies(t *testing.T) {
 	policies := cp.RepairPolicies()
 	if len(policies) != 2 {
 		t.Fatalf("RepairPolicies() returned %d policies, want 2", len(policies))
+	}
+}
+
+func TestRepairPoliciesPreserveReadyReplacement(t *testing.T) {
+	cp := newTestCloudProvider()
+	ctx := options.ToContext(context.Background(), &options.Options{
+		FeatureGates: options.FeatureGates{NodeRepair: true},
+	})
+	matcher, err := health.NewRepairPolicyMatcher(ctx, cp)
+	if err != nil {
+		t.Fatalf("node repair cannot start: %v", err)
+	}
+	transition := time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		status corev1.ConditionStatus
+		want   karpcp.RepairAction
+	}{
+		{"not ready", corev1.ConditionFalse, karpcp.ReplaceNode},
+		{"unknown", corev1.ConditionUnknown, karpcp.ReplaceNode},
+		{"healthy", corev1.ConditionTrue, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &corev1.Node{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+				Type: corev1.NodeReady, Status: tc.status, Reason: "arbitrary reason",
+				LastTransitionTime: metav1.NewTime(transition),
+			}}}}
+			matches := matcher.Match(node)
+			if got := health.Resolve(matches, transition.Add(5*time.Minute-time.Second), time.Time{}); got.Action != "" {
+				t.Fatalf("repair selected before five minutes: %+v", got)
+			}
+			if got := health.Resolve(matches, transition.Add(5*time.Minute), time.Time{}); got.Action != tc.want {
+				t.Fatalf("repair action = %q, want %q", got.Action, tc.want)
+			}
+		})
+	}
+}
+
+func TestRebootReportsUnsupported(t *testing.T) {
+	err := newTestCloudProvider().Reboot(context.Background(), &karpv1.NodeClaim{}, "repair-operation")
+	if !karpcp.IsNodeRebootNotImplementedError(err) {
+		t.Fatalf("Reboot() = %v, want the terminal unsupported-reboot error", err)
 	}
 }
 

@@ -85,6 +85,12 @@ func (cp *CloudProvider) GetSupportedNodeClasses() []status.Object {
 	return []status.Object{&apiv1.HCloudNodeClass{}}
 }
 
+// Reboot reports that this provider has no replay-safe in-place reboot operation.
+// Node repair continues to replace unhealthy nodes instead.
+func (cp *CloudProvider) Reboot(context.Context, *karpv1.NodeClaim, string) error {
+	return karpcp.NewNodeRebootNotImplementedError()
+}
+
 // RepairPolicies returns the repair policies for unhealthy nodes.
 func (cp *CloudProvider) RepairPolicies() []karpcp.RepairPolicy {
 	return []karpcp.RepairPolicy{
@@ -92,11 +98,16 @@ func (cp *CloudProvider) RepairPolicies() []karpcp.RepairPolicy {
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionFalse,
 			TolerationDuration: 5 * time.Minute,
+			Action:             karpcp.ReplaceNode,
 		},
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionUnknown,
+			ConditionType:   corev1.NodeReady,
+			ConditionStatus: corev1.ConditionUnknown,
+			// Karpenter requires exactly one fallback across the whole set.
+			// Match every Unknown reason explicitly to retain the old policy.
+			ReasonRegex:        ".*",
 			TolerationDuration: 5 * time.Minute,
+			Action:             karpcp.ReplaceNode,
 		},
 	}
 }
