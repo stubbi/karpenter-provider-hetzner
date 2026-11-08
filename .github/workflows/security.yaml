@@ -27,7 +27,7 @@ jobs:
   # On main and on the weekly schedule the question is whether what we SHIP is
   # vulnerable, and the answer must be pinned to the toolchain we ship with. That
   # scan is what turned five stdlib advisories into the 1.26.6 bump in #57, so it
-  # keeps the go.mod pin and keeps failing the build.
+  # follows the exact Docker builder version and keeps failing the build.
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
@@ -47,9 +47,16 @@ jobs:
     name: govulncheck (shipped toolchain)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v7
+      - name: Read the Docker builder Go version
+        id: builder
+        run: |
+          version=$(./hack/builder-go-version.sh)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ steps.builder.outputs.version }}
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

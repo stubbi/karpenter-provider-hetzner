@@ -18,6 +18,27 @@ jobs:
           go-version-file: go.mod
       - run: make test
 
+  shipped-toolchain:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the Docker builder Go version
+        id: builder
+        run: |
+          version=$(./hack/builder-go-version.sh)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.builder.outputs.version }}
+      - name: Build both shipped architectures
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/controller-amd64 ./cmd/controller
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/controller-arm64 ./cmd/controller
+      - run: make test
+      - run: make test-envtest
+
   lint:
     runs-on: ubuntu-latest
     steps:

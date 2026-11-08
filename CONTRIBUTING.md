@@ -8,6 +8,11 @@ Thanks for your interest in improving `karpenter-provider-hetzner`. This documen
 - `make`, `git`, `docker` (for image builds), and `helm` (for chart changes).
 - A Hetzner Cloud API token is only needed for end-to-end testing, not for unit tests.
 
+The `go.mod` directive remains the minimum supported Go version. Pull requests
+also build and run race and envtest tests with the exact Go version pinned in
+the Docker builder (currently 1.27.3). The pinned vulnerability scan uses that
+same builder version, so it checks the toolchain used for published images.
+
 ## Common tasks
 
 ```bash

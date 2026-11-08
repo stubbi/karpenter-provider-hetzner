@@ -9,5 +9,4 @@
 # OCI registry URL above). Paste the generated ID here, then re-push this file.
 repositoryID: b74823b2-1844-44eb-ab1b-5517fb941926
 owners:
-  - name: Paperclip.inc
-    email: ops@paperclip.inc
+  - name: stubbi
