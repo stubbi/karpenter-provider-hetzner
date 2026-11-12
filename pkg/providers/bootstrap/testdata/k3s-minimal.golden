@@ -1,0 +1,15 @@
+#cloud-config
+runcmd:
+- curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.31.5+k3s1 sh -s - agent
+write_files:
+- content: |
+    kubelet-arg:
+    - cloud-provider=external
+    - eviction-hard=memory.available<100Mi,nodefs.available<10%
+    node-taint:
+    - karpenter.sh/unregistered=:NoExecute
+    server: https://10.0.0.2:6443
+    token: K10agent::token
+  owner: root:root
+  path: /etc/rancher/k3s/config.yaml
+  permissions: "0600"

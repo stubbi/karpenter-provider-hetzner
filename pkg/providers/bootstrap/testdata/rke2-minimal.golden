@@ -1,0 +1,17 @@
+#cloud-config
+runcmd:
+- curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE=agent INSTALL_RKE2_VERSION=v1.31.5+rke2r1
+  sh -
+- systemctl enable --now rke2-agent.service
+write_files:
+- content: |
+    kubelet-arg:
+    - cloud-provider=external
+    - eviction-hard=memory.available<100Mi,nodefs.available<10%
+    node-taint:
+    - karpenter.sh/unregistered=:NoExecute
+    server: https://10.0.0.2:9345
+    token: agent-token
+  owner: root:root
+  path: /etc/rancher/rke2/config.yaml
+  permissions: "0600"

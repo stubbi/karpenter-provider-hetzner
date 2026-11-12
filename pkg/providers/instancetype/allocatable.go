@@ -15,9 +15,12 @@ import (
 // signal a declared kubelet block does not list. The kubelet always holds
 // something back even when nothing is configured, so modelling zero would
 // overstate what a pod can use.
+//
+// The bootstrap renderer writes the same values into the kubelet flags it
+// renders, so a provider-bootstrapped node reserves exactly what is modelled.
 const (
-	defaultMemoryEvictionThreshold = "100Mi"
-	defaultNodefsEvictionThreshold = "10%"
+	DefaultMemoryEvictionThreshold = "100Mi"
+	DefaultNodefsEvictionThreshold = "10%"
 )
 
 // overheadFor converts a node class's declared kubelet reservations into the
@@ -33,7 +36,15 @@ func overheadFor(nodeClass *apiv1.HCloudNodeClass, capacity corev1.ResourceList)
 	if nodeClass != nil {
 		kubelet = nodeClass.Spec.Kubelet
 	}
-	if kubelet == nil || len(kubelet.SystemReserved)+len(kubelet.KubeReserved)+len(kubelet.EvictionHard) == 0 {
+	// With a provider-rendered bootstrap the reservations are not a guess about
+	// someone else's userData: the provider writes exactly what it models into the
+	// kubelet flags, so an empty declaration means the kubelet's own defaults and
+	// the legacy guess below does not apply.
+	rendered := nodeClass != nil && nodeClass.Spec.Bootstrap != nil
+	if rendered && kubelet == nil {
+		kubelet = &apiv1.KubeletConfiguration{}
+	}
+	if !rendered && (kubelet == nil || len(kubelet.SystemReserved)+len(kubelet.KubeReserved)+len(kubelet.EvictionHard) == 0) {
 		// A node class that declares nothing (an empty block included) has said
 		// nothing about its bootstrap, which is not the same as saying it reserves
 		// nothing. Before this package read reservations from the node class it
@@ -84,8 +95,8 @@ func evictionThreshold(hard map[string]apiv1.EvictionThreshold, capacity corev1.
 		return q
 	}
 	return corev1.ResourceList{
-		corev1.ResourceMemory:           signal("memory.available", defaultMemoryEvictionThreshold, capacity[corev1.ResourceMemory]),
-		corev1.ResourceEphemeralStorage: signal("nodefs.available", defaultNodefsEvictionThreshold, capacity[corev1.ResourceEphemeralStorage]),
+		corev1.ResourceMemory:           signal("memory.available", DefaultMemoryEvictionThreshold, capacity[corev1.ResourceMemory]),
+		corev1.ResourceEphemeralStorage: signal("nodefs.available", DefaultNodefsEvictionThreshold, capacity[corev1.ResourceEphemeralStorage]),
 	}
 }
 

@@ -12,6 +12,11 @@ const (
 	ConditionTypeNetworkReady   = "NetworkReady"
 	ConditionTypeResourcesReady = "ResourcesReady"
 	ConditionTypeUserDataReady  = "UserDataReady"
+	// ConditionTypeBootstrapReady reports whether the provider can render the
+	// node bootstrap from spec.bootstrap: the join token Secret resolves and the
+	// user's cloud-config extension merges cleanly. True when spec.bootstrap is
+	// unset, since there is nothing to render.
+	ConditionTypeBootstrapReady = "BootstrapReady"
 )
 
 // +kubebuilder:object:root=true
@@ -26,6 +31,8 @@ type HCloudNodeClass struct {
 }
 
 // +kubebuilder:validation:XValidation:message="placementGroupIDs cannot be combined with placementGroupStrategy none",rule="!has(self.placementGroupIDs) || !has(self.placementGroupStrategy) || self.placementGroupStrategy != 'none'"
+// +kubebuilder:validation:XValidation:message="spec.bootstrap cannot be combined with imageSelector.family talos: a Talos image joins through its machine config, not cloud-init",rule="!has(self.bootstrap) || self.imageSelector.family != 'talos'"
+// +kubebuilder:validation:XValidation:message="with spec.bootstrap, userData extends the rendered cloud-config and must itself be a cloud-config starting with #cloud-config",rule="!has(self.bootstrap) || !has(self.userData) || self.userData.startsWith('#cloud-config')"
 type HCloudNodeClassSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	Locations []string `json:"locations"`
@@ -105,6 +112,11 @@ type HCloudNodeClassSpec struct {
 	// is, which strands pods on nodes too small for them.
 	//
 	// When omitted, a flat 100m CPU / 100Mi memory kubeReserved is assumed.
+	//
+	// With spec.bootstrap set, the provider does render the bootstrap: these
+	// values are written into the kubelet flags, so they become prescriptive and
+	// an empty or absent block means the kubelet's own defaults rather than the
+	// flat 100m/100Mi above.
 	// +optional
 	Kubelet *KubeletConfiguration `json:"kubelet,omitempty"`
 
@@ -123,6 +135,71 @@ type HCloudNodeClassSpec struct {
 	// +kubebuilder:validation:MaxLength=5
 	// +optional
 	VMMemoryOverheadPercent string `json:"vmMemoryOverheadPercent,omitempty"`
+
+	// Bootstrap makes the provider render the node's join configuration for a
+	// k3s or RKE2 agent, instead of the operator hand-writing it in userData. The
+	// provider renders the join config (server, token from a Secret, the
+	// karpenter.sh/unregistered:NoExecute taint, kubelet-arg for the reservations
+	// in spec.kubelet) and the install command, so the registration contract and
+	// the advertised allocatable cannot drift from what the node runs.
+	//
+	// userData or userDataSecretRef, when set alongside it, must be a
+	// #cloud-config document and is merged into the rendered one: list keys are
+	// combined with the provider's entries first, and a key or file path the
+	// provider owns is an error rather than silently overridden.
+	//
+	// Opt-in: without it, userData is passed through unchanged as before. Not
+	// supported with imageSelector.family talos.
+	// +optional
+	Bootstrap *BootstrapConfiguration `json:"bootstrap,omitempty"`
+}
+
+// BootstrapConfiguration describes how a node joins a k3s or RKE2 cluster.
+type BootstrapConfiguration struct {
+	// Distribution is the agent to install: k3s or rke2.
+	// +kubebuilder:validation:Enum=k3s;rke2
+	Distribution string `json:"distribution"`
+
+	// Server is the URL agents join, e.g. https://10.0.0.2:6443 for k3s or
+	// https://10.0.0.2:9345 for RKE2.
+	// +kubebuilder:validation:Pattern=`^https://[^\s/?#]+(/[^\s]*)?$`
+	// +kubebuilder:validation:MaxLength=2048
+	Server string `json:"server"`
+
+	// TokenSecretRef names the Secret key holding the join token. It is always
+	// read from the namespace the provider runs in, never another one. Use an
+	// agent token (k3s --agent-token), not the server token: the rendered
+	// userData is readable from the Hetzner metadata service on every node.
+	TokenSecretRef BootstrapTokenSecretReference `json:"tokenSecretRef"`
+
+	// Version pins the agent release (INSTALL_K3S_VERSION /
+	// INSTALL_RKE2_VERSION), e.g. v1.31.5+k3s1. When omitted the installer's
+	// stable channel is used; pin it to match your servers.
+	// +kubebuilder:validation:Pattern=`^v[0-9A-Za-z.+_-]+$`
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	Version string `json:"version,omitempty"`
+
+	// ExtraConfig is a YAML mapping merged into the rendered agent config file
+	// (/etc/rancher/k3s/config.yaml or /etc/rancher/rke2/config.yaml), e.g.
+	// "node-ip: ..." or "flannel-iface: enp7s0". server and token are owned by
+	// the provider and rejected here; node-taint, node-label and kubelet-arg
+	// entries are appended to the provider's, except ones that would replace a
+	// provider-owned flag or the karpenter.sh/unregistered taint.
+	// +kubebuilder:validation:MaxLength=16384
+	// +optional
+	ExtraConfig string `json:"extraConfig,omitempty"`
+}
+
+// BootstrapTokenSecretReference points at a Secret key in the provider's own
+// namespace.
+type BootstrapTokenSecretReference struct {
+	// Name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// Key within the Secret's data holding the join token.
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key"`
 }
 
 // KubeletConfiguration mirrors the subset of kubelet settings that change how
@@ -233,7 +310,7 @@ type HCloudNodeClassStatus struct {
 	ResolvedImages []ResolvedImage `json:"resolvedImages,omitempty"`
 }
 
-var conditionTypes = status.NewReadyConditions(ConditionTypeImagesReady, ConditionTypeLocationsReady, ConditionTypeNetworkReady, ConditionTypeResourcesReady, ConditionTypeUserDataReady)
+var conditionTypes = status.NewReadyConditions(ConditionTypeImagesReady, ConditionTypeLocationsReady, ConditionTypeNetworkReady, ConditionTypeResourcesReady, ConditionTypeUserDataReady, ConditionTypeBootstrapReady)
 
 func (in *HCloudNodeClass) GetConditions() []status.Condition {
 	return in.Status.Conditions

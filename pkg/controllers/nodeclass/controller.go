@@ -22,6 +22,7 @@ import (
 	apiv1 "github.com/paperclipinc/karpenter-provider-hetzner/pkg/apis/v1"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/deadline"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/metrics"
+	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/bootstrap"
 	"github.com/paperclipinc/karpenter-provider-hetzner/pkg/providers/imagefamily"
 )
 
@@ -65,6 +66,16 @@ type Controller struct {
 	// timeout bounds one reconcile (see deadline.Read). controller-runtime
 	// imposes none, so without it a slow API call holds the worker indefinitely.
 	timeout time.Duration
+	// namespace is the provider's own namespace, where spec.bootstrap token
+	// Secrets live.
+	namespace string
+}
+
+// WithControllerNamespace sets the namespace spec.bootstrap token Secrets are read
+// from.
+func (c *Controller) WithControllerNamespace(namespace string) *Controller {
+	c.namespace = namespace
+	return c
 }
 
 func NewController(kubeClient client.Client, networks NetworkGetter, locations LocationLister, firewalls FirewallGetter, sshKeys SSHKeyGetter, images *imagefamily.Provider) *Controller {
@@ -136,6 +147,18 @@ func (c *Controller) Reconcile(ctx context.Context, nc *apiv1.HCloudNodeClass) (
 	} else {
 		nc.StatusConditions().SetFalse(apiv1.ConditionTypeUserDataReady, reason, msg)
 		c.warnf(nc, reason, "ValidateUserData", "%s", msg)
+	}
+
+	// Validate the provider-rendered bootstrap (if set): everything that can make a
+	// launch fail before a server exists, surfaced here rather than per NodeClaim.
+	if reason, msg, unknown, ok := c.validateBootstrap(ctx, nc); ok {
+		nc.StatusConditions().SetTrue(apiv1.ConditionTypeBootstrapReady)
+	} else if unknown {
+		nc.StatusConditions().SetUnknownWithReason(apiv1.ConditionTypeBootstrapReady, reason, msg)
+		c.warnf(nc, reason, "ValidateBootstrap", "%s", msg)
+	} else {
+		nc.StatusConditions().SetFalse(apiv1.ConditionTypeBootstrapReady, reason, msg)
+		c.warnf(nc, reason, "ValidateBootstrap", "%s", msg)
 	}
 
 	// Image resolution for both architectures.
@@ -327,6 +350,40 @@ func (c *Controller) validateUserData(ctx context.Context, nc *apiv1.HCloudNodeC
 	}
 	if v, present := secret.Data[ref.Key]; !present || len(v) == 0 {
 		return "UserDataKeyMissing", fmt.Sprintf("secret %s/%s has no non-empty key %q", ref.Namespace, ref.Name, ref.Key), false, false
+	}
+	return "", "", false, true
+}
+
+// validateBootstrap checks that spec.bootstrap can be rendered: the join token
+// Secret and key exist in the provider's namespace, and the userData extension
+// merges with the rendered cloud-config. ok=true when bootstrap is unset.
+func (c *Controller) validateBootstrap(ctx context.Context, nc *apiv1.HCloudNodeClass) (reason, msg string, unknown, ok bool) {
+	b := nc.Spec.Bootstrap
+	if b == nil {
+		return "", "", false, true
+	}
+	token, err := bootstrap.ReadToken(ctx, c.kubeClient, c.namespace, b.TokenSecretRef)
+	if err != nil {
+		if errors.Is(err, bootstrap.ErrTokenUnavailable) {
+			return "BootstrapTokenUnavailable", err.Error(), false, false
+		}
+		return "BootstrapCheckFailed", err.Error(), true, false
+	}
+	extension := nc.Spec.UserData
+	if ref := nc.Spec.UserDataSecretRef; ref != nil {
+		secret := &corev1.Secret{}
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+			// UserDataReady reports the Secret itself; the merge cannot be checked
+			// without it.
+			return "BootstrapCheckFailed", fmt.Sprintf("cannot check the userData extension: %v", err), true, false
+		}
+		extension = string(secret.Data[ref.Key])
+	}
+	if _, err := bootstrap.Render(bootstrap.Input{Bootstrap: *b, Kubelet: nc.Spec.Kubelet, Token: token, UserData: extension}); err != nil {
+		if bootstrap.IsInvalid(err) {
+			return "BootstrapInvalid", err.Error(), false, false
+		}
+		return "BootstrapCheckFailed", err.Error(), true, false
 	}
 	return "", "", false, true
 }

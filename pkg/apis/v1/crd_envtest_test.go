@@ -91,6 +91,38 @@ func TestCRD_KubeletAdmission(t *testing.T) {
 			}
 		})
 	}
+
+	boot := func(mutate func(map[string]any)) map[string]any {
+		b := map[string]any{
+			"distribution":   "k3s",
+			"server":         "https://10.0.0.2:6443",
+			"tokenSecretRef": map[string]any{"name": "join", "key": "token"},
+		}
+		if mutate != nil {
+			mutate(b)
+		}
+		return b
+	}
+	for name, tc := range map[string]struct {
+		spec  map[string]any
+		admit bool
+	}{
+		"bootstrap":                        {map[string]any{"bootstrap": boot(nil)}, true},
+		"bootstrap with cloud-config":      {map[string]any{"bootstrap": boot(nil), "userData": "#cloud-config\nruncmd: [echo]"}, true},
+		"bootstrap with a shell script":    {map[string]any{"bootstrap": boot(nil), "userData": "#!/bin/sh\necho"}, false},
+		"bootstrap with talos":             {map[string]any{"bootstrap": boot(nil), "imageSelector": map[string]any{"family": "talos"}}, false},
+		"bootstrap over plain http":        {map[string]any{"bootstrap": boot(func(b map[string]any) { b["server"] = "http://10.0.0.2:6443" })}, false},
+		"bootstrap with unknown distro":    {map[string]any{"bootstrap": boot(func(b map[string]any) { b["distribution"] = "kubeadm" })}, false},
+		"bootstrap with a bad version":     {map[string]any{"bootstrap": boot(func(b map[string]any) { b["version"] = "latest" })}, false},
+		"bootstrap without a token key":    {map[string]any{"bootstrap": boot(func(b map[string]any) { b["tokenSecretRef"] = map[string]any{"name": "join"} })}, false},
+		"shell userData without bootstrap": {map[string]any{"userData": "#!/bin/sh\necho"}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := createSpec(tc.spec); (err == nil) != tc.admit {
+				t.Errorf("admitted=%v, want %v (err: %v)", err == nil, tc.admit, err)
+			}
+		})
+	}
 }
 
 // TestCRD_PlacementGroupAdmission checks spec.placementGroupIDs admission on a
