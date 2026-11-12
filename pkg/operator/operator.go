@@ -119,6 +119,17 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 	// once every few seconds per in-flight create (see pollBackoff). The default of 2 idle connections per
 	// host makes concurrent launches tear down and redial TLS constantly.
 	transport.MaxIdleConnsPerHost = 20
+	// HTTP/2 multiplexes every request onto one connection, and Client.Timeout
+	// only resets the stream, never the connection (golang/go#36026). If the peer
+	// vanishes without an RST or GOAWAY (a load balancer or NAT dropping the flow),
+	// each new request is sent down the same dead connection and times out in turn
+	// until the kernel abandons the socket, ~15 minutes with default tcp_retries2.
+	// A ping after 15s of silence that goes unanswered for another 15s closes the
+	// connection, so the next request dials a fresh one.
+	transport.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout: 15 * time.Second,
+		PingTimeout:     15 * time.Second,
+	}
 	return &http.Client{Timeout: timeout, Transport: rateLimitTransport{next: transport}}
 }
 

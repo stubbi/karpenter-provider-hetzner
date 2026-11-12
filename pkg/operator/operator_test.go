@@ -98,6 +98,9 @@ func TestNewHTTPClient_BoundsEveryPhase(t *testing.T) {
 	if tr.Proxy == nil {
 		t.Error("Proxy is nil: a bare transport ignores HTTPS_PROXY, which breaks clusters with egress proxies")
 	}
+	if tr.HTTP2 == nil || tr.HTTP2.SendPingTimeout <= 0 || tr.HTTP2.PingTimeout <= 0 {
+		t.Error("HTTP/2 health check is unset, so a silently dropped connection is reused until the kernel gives up on it (~15m)")
+	}
 }
 
 func TestLoadConfig_APITimeoutDefaultsWhenUnset(t *testing.T) {
