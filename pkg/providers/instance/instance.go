@@ -55,6 +55,10 @@ type Provider struct {
 	nowFn   func() time.Time
 
 	budgets deadline.Budgets
+
+	// snapshot serves GetForDrift (snapshot.go); created on first use.
+	snapshotOnce sync.Once
+	snapshot     *serverSnapshot
 }
 
 // NewProvider returns a Provider that does NOT wait for hcloud actions to
@@ -422,6 +426,22 @@ func (p *Provider) Get(ctx context.Context, providerID string) (*hcloud.Server, 
 		return nil, fmt.Errorf("getting server %d: %w", id, err)
 	}
 	return server, nil
+}
+
+// GetForDrift is Get for drift checks: it reads the server from a shared snapshot of
+// this cluster's servers, refreshed at most every DefaultSnapshotTTL, instead of making
+// one request per call (snapshot.go). Create, Delete and liveness keep using Get.
+func (p *Provider) GetForDrift(ctx context.Context, providerID string) (*hcloud.Server, error) {
+	id, err := ParseProviderID(providerID)
+	if err != nil {
+		return nil, fmt.Errorf("parsing provider ID %q: %w", providerID, err)
+	}
+	p.snapshotOnce.Do(func() {
+		p.snapshot = newServerSnapshot(p.List, func(ctx context.Context, id int64) (*hcloud.Server, error) {
+			return p.Get(ctx, FormatProviderID(id))
+		}, DefaultSnapshotTTL, p.now)
+	})
+	return p.snapshot.Get(ctx, id)
 }
 
 // List returns all servers managed by this Karpenter instance.

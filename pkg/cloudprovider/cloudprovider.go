@@ -461,7 +461,8 @@ func (cp *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCl
 		return "", fmt.Errorf("resolving node class: %w", err)
 	}
 
-	server, err := cp.instanceProvider.Get(ctx, nodeClaim.Status.ProviderID)
+	// Served from a shared snapshot: core calls this on every pod event on the node.
+	server, err := cp.instanceProvider.GetForDrift(ctx, nodeClaim.Status.ProviderID)
 	if err != nil {
 		return "", fmt.Errorf("getting server: %w", err)
 	}
