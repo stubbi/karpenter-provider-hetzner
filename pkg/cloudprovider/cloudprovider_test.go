@@ -62,6 +62,9 @@ type fakeServerClient struct {
 	createErr error
 	nextID    int64
 	lastOpts  hcloud.ServerCreateOpts
+	// getCalls and listCalls count API reads, for request-budget tests.
+	getCalls  int
+	listCalls int
 }
 
 func (f *fakeServerClient) lastUserData() string {
@@ -92,10 +95,12 @@ func (f *fakeServerClient) DeleteWithResult(_ context.Context, server *hcloud.Se
 }
 
 func (f *fakeServerClient) GetByID(_ context.Context, id int64) (*hcloud.Server, *hcloud.Response, error) {
+	f.getCalls++
 	return f.servers[id], nil, nil
 }
 
 func (f *fakeServerClient) AllWithOpts(_ context.Context, opts hcloud.ServerListOpts) ([]*hcloud.Server, error) {
+	f.listCalls++
 	out := make([]*hcloud.Server, 0, len(f.servers))
 	for _, s := range f.servers {
 		if matchesLabelSelector(s.Labels, opts.LabelSelector) {
@@ -1335,5 +1340,38 @@ func TestGetInstanceTypes_AppliesNodeClassKubelet(t *testing.T) {
 	capCPU, allocCPU := its[0].Capacity[corev1.ResourceCPU], its[0].Allocatable()[corev1.ResourceCPU]
 	if got := capCPU.MilliValue() - allocCPU.MilliValue(); got != 400 {
 		t.Errorf("cpu reserved %dm, want the declared 400m", got)
+	}
+}
+
+// Core re-runs drift detection on every pod event on a node (#126). Those checks must
+// share one server list instead of making one GET /servers/{id} each.
+func TestIsDrifted_RepeatedChecksShareOneServerList(t *testing.T) {
+	_ = apiv1.SchemeBuilder.AddToScheme(scheme.Scheme)
+	nc := baselineNodeClass()
+	kube := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(nc).Build()
+	fsc := &fakeServerClient{servers: map[int64]*hcloud.Server{}}
+	var claims []*karpv1.NodeClaim
+	for id := int64(50); id < 60; id++ {
+		s := baselineServer()
+		s.ID = id
+		s.Labels = map[string]string{apiv1.ServerLabelManagedBy: apiv1.ServerValueManagedBy, apiv1.ServerLabelCluster: "test-cluster"}
+		fsc.servers[id] = s
+		claim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-" + strconv.FormatInt(id, 10), Labels: map[string]string{}}}
+		claim.Spec.NodeClassRef = &karpv1.NodeClassReference{Name: nc.Name, Group: apiv1.Group, Kind: "HCloudNodeClass"}
+		claim.Status.ProviderID = instance.FormatProviderID(id)
+		claims = append(claims, claim)
+	}
+	cp := cloudprovider.NewCloudProvider(kube, instance.NewProvider(fsc, "test-cluster"),
+		instancetype.NewProvider(&fakeServerTypeClient{}), imagefamily.NewProvider(&fakeImageClient{}))
+
+	for round := 0; round < 50; round++ {
+		for _, claim := range claims {
+			if reason, err := cp.IsDrifted(context.Background(), claim); err != nil || reason != "" {
+				t.Fatalf("%s: reason %q, err %v", claim.Name, reason, err)
+			}
+		}
+	}
+	if fsc.listCalls != 1 || fsc.getCalls != 0 {
+		t.Errorf("500 drift checks on 10 nodes: want 1 list and 0 gets, got %d lists and %d gets", fsc.listCalls, fsc.getCalls)
 	}
 }

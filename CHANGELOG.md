@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Drift checks no longer make one `GET /servers/{id}` each. Karpenter core re-runs drift detection on every event of any pod on a node, so on a pool with high pod churn (ephemeral CI runners) those requests alone used the whole hcloud project budget and starved server creates, the CCM and CSI volume attaches with `rate_limit_exceeded`. `IsDrifted` now reads servers from one shared list of the cluster's servers, refreshed at most once a minute by a single request that concurrent callers wait for. A failed refresh keeps serving the previous list (never an empty one) and backs off from 5 s to 5 min, so a 429 does not turn into a request per pod event. A server missing from the list is looked up live once per refresh. Create, delete and liveness reads stay live (#126).
+
 ### Changed
 - Build release images with Go 1.27.4, which fixes GO-2026-6859 in the shipped standard library. CI now also builds and runs race and envtest tests with the exact Docker builder toolchain, while keeping the existing Go 1.26.10 minimum-version checks. The pinned vulnerability scan follows the Docker builder version rather than the module minimum.
 
